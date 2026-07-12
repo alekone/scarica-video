@@ -1,0 +1,9 @@
+# Generati dal build
+icon_1024.png
+AppIcon.icns
+build.iconset/
+
+# macOS / Python
+.DS_Store
+__pycache__/
+*.pyc

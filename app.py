@@ -289,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"ok": True})
         elif self.path == "/api/quit":
             self._send({"ok": True})
-            threading.Thread(target=lambda: (server.shutdown()), daemon=True).start()
+            threading.Timer(0.3, lambda: os._exit(0)).start()
         else:
             self.send_error(404)
 
@@ -456,12 +456,48 @@ refresh();
 </script></div></body></html>"""
 
 
+def set_mac_identity():
+    """Icona nel Dock/Cmd-Tab e nome dell'app, anche girando dentro un venv."""
+    try:
+        from AppKit import NSApplication, NSImage
+        from Foundation import NSBundle
+        icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "applet.icns")
+        bundle = NSBundle.mainBundle()
+        info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+        if info is not None:
+            info["CFBundleName"] = "Scarica Video"
+        app = NSApplication.sharedApplication()
+        if os.path.exists(icon):
+            app.setApplicationIconImage_(NSImage.alloc().initByReferencingFile_(icon))
+    except Exception:
+        pass
+
+
+def start_server():
+    global server
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
 if __name__ == "__main__":
     init_db()
     os.makedirs(DEST, exist_ok=True)
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Scarica Video → http://127.0.0.1:{PORT}   (Ctrl+C per uscire)")
+    url = f"http://127.0.0.1:{PORT}/"
+    # Avvia il server; se la porta è occupata un'istanza è già attiva -> apri solo la finestra
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
+        start_server()
+    except OSError:
         pass
+    try:
+        import webview
+        set_mac_identity()
+        webview.create_window("Scarica Video", url, width=780, height=920,
+                              min_size=(560, 640))
+        webview.start()          # blocca finché la finestra resta aperta; chiusura = uscita
+    except ImportError:
+        # Nessun pywebview (uso da riga di comando): resta come server headless
+        print(f"Scarica Video → {url}   (Ctrl+C per uscire)")
+        try:
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass

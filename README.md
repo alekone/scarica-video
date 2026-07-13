@@ -1,8 +1,8 @@
 # Scarica Video
 
-App locale per macOS per scaricare video da **YouTube, TikTok, Instagram** e [centinaia di altri siti](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md). Interfaccia pulita in una finestra dedicata, coda con download in parallelo, cronologia e taglio per intervallo di minutaggio.
+App locale per macOS per scaricare video da **YouTube, TikTok, Instagram** e [centinaia di altri siti](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md). Interfaccia pulita in una **finestra nativa** (app vera con icona nel Dock e in Cmd+Tab), coda con download in parallelo, cronologia e taglio per intervallo di minutaggio.
 
-Sotto il cofano usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp); il backend è **solo Python standard library** (nessuna dipendenza da installare via pip).
+Sotto il cofano usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp); il backend è **solo Python standard library**. L'unica dipendenza è [`pywebview`](https://pywebview.flowrl.com/) per la finestra nativa, installata in automatico da `build.sh` in un venv dedicato.
 
 ## Funzioni
 
@@ -13,7 +13,7 @@ Sotto il cofano usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp); il backend è 
 - 🔐 **Login via cookie del browser** (Chrome/Safari/Firefox) per i siti che lo richiedono — TikTok, Instagram
 - 🖼️ **Foto e caroselli** — fallback automatico su [`gallery-dl`](https://github.com/mikf/gallery-dl) quando non c'è un video
 - 🎞️ **Qualità pensata per l'editing** — default 1080p **H.264/AAC**, pronto per DaVinci Resolve
-- 🪟 **Finestra dedicata** senza barra del browser (Chrome/Brave/Edge in app-mode)
+- 🪟 **Finestra nativa macOS** (WKWebView via pywebview): icona propria nel Dock, voce in Cmd+Tab, si chiude come una qualsiasi app
 
 I file finiscono in `~/Movies/Scarica Video`.
 
@@ -34,13 +34,13 @@ cd scarica-video
 ./build.sh
 ```
 
-Crea **`Scarica Video.app`** in `~/Applications`. Aprila da Spotlight o Launchpad.
+`build.sh` crea un venv in `~/Library/Application Support/Scarica Video/venv`, ci installa `pywebview` e assembla **`Scarica Video.app`** in `~/Applications`. Aprila da Spotlight o Launchpad.
 
-> Al primo avvio macOS può chiedere conferma (app non firmata da uno sviluppatore identificato): **click destro sull'app → Apri → Apri**. E autorizza il controllo del browser quando richiesto.
+> Al primo avvio macOS può chiedere conferma (app non firmata da uno sviluppatore identificato): **click destro sull'app → Apri → Apri**.
 
-### Uso senza app
+### Uso senza app (headless)
 
-Puoi lanciare direttamente il backend:
+Puoi lanciare direttamente il backend; senza `pywebview` resta un server web:
 
 ```bash
 python3 app.py    # poi apri http://127.0.0.1:8642
@@ -48,9 +48,8 @@ python3 app.py    # poi apri http://127.0.0.1:8642
 
 ## Come funziona
 
-- `app.py` — server HTTP locale (stdlib) + interfaccia web. Gestisce coda, progressi, cronologia SQLite in `~/Library/Application Support/Scarica Video/`.
-- `launcher.applescript` — avvia il server e apre la finestra in app-mode.
-- `build.sh` — compila la `.app`, genera e applica l'icona.
+- `app.py` — server HTTP locale (stdlib) + interfaccia web + finestra nativa (pywebview, se disponibile). Gestisce coda, progressi, cronologia SQLite in `~/Library/Application Support/Scarica Video/`.
+- `build.sh` — prepara il venv, genera l'icona e assembla il bundle `.app` (launcher nativo + `Info.plist`).
 - `makeicon.py` — disegna l'icona (nessuna dipendenza grafica).
 
 ## Licenza

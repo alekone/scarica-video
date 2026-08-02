@@ -38,16 +38,21 @@ def find_bin(name):
 
 YTDLP = find_bin("yt-dlp")
 GDL = find_bin("gallery-dl")
-MAX_CONCURRENT = 3
 # Token per-avvio: le API rispondono solo alla nostra pagina, non ad altri
 # siti aperti nel browser (CSRF su 127.0.0.1)
 TOKEN = uuid.uuid4().hex
+
+CONFIG_PATH = os.path.join(SUPPORT, "config.json")
+CONFIG_DEFAULTS = {"dest": DEST, "quality": "1080", "browser": "none",
+                   "concurrent": 3, "fragments": 4}
+config = dict(CONFIG_DEFAULTS)
+_applied_concurrent = config["concurrent"]
 
 jobs = {}
 jobs_order = []
 done_count = 0
 lock = threading.Lock()
-slots = threading.Semaphore(MAX_CONCURRENT)
+slots = threading.Semaphore(config["concurrent"])
 db_lock = threading.Lock()
 
 PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
@@ -61,6 +66,59 @@ DEST_RE = re.compile(
 ALREADY_RE = re.compile(
     r"(/[^\n]+?\.(?:mp4|m4a|webm|mkv|mp3|mov)) has already been downloaded"
 )
+
+
+# ---------------------------------------------------------------- config
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+        config.update({k: data[k] for k in CONFIG_DEFAULTS if k in data})
+    except Exception:
+        pass
+    apply_config()
+
+
+def save_config():
+    os.makedirs(SUPPORT, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def apply_config():
+    global DEST, slots, _applied_concurrent
+    DEST = os.path.expanduser(str(config["dest"]))
+    os.makedirs(DEST, exist_ok=True)
+    # Nuovo semaforo solo se il limite cambia: i job già in coda restano
+    # legati al vecchio, quelli nuovi usano il nuovo
+    if config["concurrent"] != _applied_concurrent:
+        slots = threading.Semaphore(int(config["concurrent"]))
+        _applied_concurrent = config["concurrent"]
+
+
+MEDIA_EXTS = (".mp4", ".m4a", ".webm", ".mkv", ".mp3", ".mov",
+              ".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif")
+
+
+def list_files(limit=80):
+    try:
+        entries = list(os.scandir(DEST))
+    except OSError:
+        return []
+    out = []
+    for e in entries:
+        if e.name.startswith(".") or not e.name.lower().endswith(MEDIA_EXTS):
+            continue
+        try:
+            if not e.is_file():
+                continue
+            st = e.stat()
+        except OSError:
+            continue
+        out.append({"name": e.name, "path": e.path,
+                    "size": st.st_size, "mtime": st.st_mtime})
+    out.sort(key=lambda f: -f["mtime"])
+    return out[:limit]
 
 
 # ---------------------------------------------------------------- database
@@ -172,7 +230,8 @@ def run_job(job_id):
             tag = job["section"].lstrip("*").replace(":", ".").replace("/", "-")
             outtmpl += f" [taglio {tag}]"
         while True:
-            args = [YTDLP, "--newline", "--no-playlist", "-N", "4",
+            args = [YTDLP, "--newline", "--no-playlist",
+                    "-N", str(config["fragments"]),
                     "-o", os.path.join(DEST, outtmpl + ".%(ext)s")]
             if browser != "none":
                 args += ["--cookies-from-browser", browser]
@@ -324,6 +383,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(data)
         elif self.path == "/api/history":
             self._send(load_history())
+        elif self.path == "/api/files":
+            self._send(list_files())
+        elif self.path == "/api/settings":
+            self._send(config)
         else:
             self.send_error(404)
 
@@ -354,6 +417,31 @@ class Handler(BaseHTTPRequestHandler):
             os.makedirs(DEST, exist_ok=True)
             subprocess.Popen(["open", DEST])
             self._send({"ok": True})
+        elif self.path == "/api/settings":
+            d = self._body()
+            dest = os.path.expanduser(str(d.get("dest") or config["dest"]).strip()
+                                      or config["dest"])
+            try:
+                os.makedirs(dest, exist_ok=True)
+            except OSError as e:
+                self._send({"ok": False, "error": f"cartella non valida: {e}"},
+                           code=400)
+                return
+            config["dest"] = dest
+            if d.get("quality") in {"1080", "720", "best", "max", "audio"}:
+                config["quality"] = d["quality"]
+            if d.get("browser") in {"none", "chrome", "safari", "firefox"}:
+                config["browser"] = d["browser"]
+            try:
+                config["concurrent"] = min(6, max(1, int(d.get("concurrent",
+                                           config["concurrent"]))))
+                config["fragments"] = min(8, max(1, int(d.get("fragments",
+                                          config["fragments"]))))
+            except (TypeError, ValueError):
+                pass
+            save_config()
+            apply_config()
+            self._send({"ok": True, **config})
         elif self.path == "/api/quit":
             self._send({"ok": True})
             threading.Timer(0.3, lambda: os._exit(0)).start()
@@ -377,7 +465,7 @@ HTML = r"""<!doctype html>
   * { box-sizing:border-box; margin:0 }
   body { font:15px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;
     background:var(--bg); color:var(--text); }
-  .wrap { max-width:720px; margin:0 auto; padding:26px 20px 60px }
+  .wrap { max-width:720px; margin:0 auto; padding:26px 20px 250px }
   header { display:flex; align-items:center; gap:12px; margin-bottom:18px }
   .logo { width:38px; height:38px; border-radius:10px;
     background:linear-gradient(160deg,var(--accent2),var(--accent));
@@ -427,17 +515,54 @@ HTML = r"""<!doctype html>
   .chip:hover { border-color:var(--accent); color:var(--accent) }
   .empty { color:var(--muted); font-size:13px; padding:8px 4px }
   .dot { font-size:11px; color:var(--muted) }
+  kbd { font:600 10px/1 -apple-system,system-ui,sans-serif; border:1px solid var(--line);
+    border-bottom-width:2px; border-radius:4px; padding:2px 5px; background:var(--bg);
+    color:var(--muted) }
+  .pv { display:none; margin-top:12px }
+  .pv.on { display:block }
+  .pvframe { position:relative; width:100%; aspect-ratio:16/9; background:#000;
+    border-radius:11px; overflow:hidden }
+  .pvframe iframe { position:absolute; inset:0; width:100%; height:100%; border:0 }
+  .pvbar { display:flex; gap:9px; align-items:center; margin-top:9px; flex-wrap:wrap }
+  .fm { position:fixed; left:0; right:0; bottom:0; z-index:40; background:var(--card);
+    border-top:1px solid var(--line) }
+  .fmhead { display:flex; align-items:center; gap:9px; padding:9px 20px; cursor:pointer;
+    font-size:13px; font-weight:600; max-width:720px; margin:0 auto }
+  .fmbody { max-height:172px; overflow-y:auto; padding:0 20px 12px;
+    max-width:720px; margin:0 auto }
+  .fm.closed .fmbody { display:none }
+  .frow { display:flex; align-items:center; gap:10px; background:var(--bg);
+    border:1px solid var(--line); border-radius:10px; padding:8px 11px; margin-bottom:6px }
+  .fname { flex:1; min-width:0; font-size:13px; font-weight:600; color:var(--text);
+    text-decoration:none; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    cursor:grab }
+  .fmeta { font-size:11px; color:var(--muted); white-space:nowrap }
+  .overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.45);
+    z-index:50; align-items:center; justify-content:center }
+  .overlay.on { display:flex }
+  .sheet { background:var(--card); border:1px solid var(--line); border-radius:16px;
+    padding:20px; width:min(460px,92vw) }
+  .sheet h3 { font-size:16px; margin-bottom:14px }
+  .field { margin-bottom:11px }
+  .field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px }
+  .field input, .field select { width:100%; padding:9px 11px; border-radius:10px;
+    border:1px solid var(--line); background:var(--bg); color:var(--text);
+    font:inherit; font-size:13px }
+  .cols { display:flex; gap:10px }
+  .cols .field { flex:1 }
+  .sheetacts { display:flex; gap:9px; justify-content:flex-end; margin-top:14px }
 </style></head><body><div class="wrap">
 <header>
   <div class="logo"><svg viewBox="0 0 24 24"><path d="M12 3v10.2l3.6-3.6L17 11l-5 5-5-5 1.4-1.4L12 13.2V3h0zM5 19h14v2H5z"/></svg></div>
   <div><h1>Scarica Video</h1><div class="sub">YouTube · TikTok · Instagram e centinaia di siti</div></div>
   <div class="spacer"></div>
   <button class="ghost" onclick="openFolder()">Apri cartella</button>
+  <button class="ghost" onclick="openSettings()">Impostazioni</button>
   <button class="ghost" onclick="quitApp()">Esci</button>
 </header>
 
 <div class="panel">
-  <textarea id="urls" placeholder="Incolla uno o più link (uno per riga)&#10;https://www.youtube.com/watch?v=…&#10;https://www.tiktok.com/@utente/video/…"></textarea>
+  <textarea id="urls" oninput="checkPreview()" placeholder="Incolla uno o più link (uno per riga)&#10;https://www.youtube.com/watch?v=…&#10;https://www.tiktok.com/@utente/video/…"></textarea>
   <div class="controls">
     <select id="quality" class="grow">
       <option value="1080" selected>1080p — H.264 (per DaVinci)</option>
@@ -462,10 +587,58 @@ HTML = r"""<!doctype html>
     <label>A</label><input id="end" placeholder="1:30">
     <span class="dot">formato mm:ss · taglio preciso ai keyframe</span>
   </div>
+  <div class="pv" id="pv">
+    <div class="pvframe"><iframe id="yt" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe></div>
+    <div class="pvbar">
+      <button class="chip" onclick="setIn()"><kbd>I</kbd> IN <span id="inV">—</span></button>
+      <button class="chip" onclick="setOut()"><kbd>O</kbd> OUT <span id="outV">—</span></button>
+      <span class="dot">pausa sul punto giusto, poi I / O · clicca fuori dal player per usare la tastiera</span>
+    </div>
+  </div>
 </div>
 
 <div id="activeWrap" style="display:none"><h2>In download</h2><div id="active"></div></div>
-<h2>Cronologia</h2><div id="history"><div class="empty">Ancora niente. I file finiscono in ~/Movies/Scarica Video.</div></div>
+<h2>Cronologia</h2><div id="history"><div class="empty">Ancora niente.</div></div>
+
+<div class="fm" id="fm">
+  <div class="fmhead" onclick="toggleFm()">
+    <span>📁</span><span id="fmTitle">Cartella download</span>
+    <span class="dot" id="fmCount"></span>
+    <span class="spacer"></span>
+    <button class="ghost" onclick="event.stopPropagation();loadFiles()">Aggiorna</button>
+  </div>
+  <div class="fmbody" id="files"></div>
+</div>
+
+<div class="overlay" id="ovl" onclick="if(event.target===this)closeSettings()">
+  <div class="sheet">
+    <h3>Impostazioni</h3>
+    <div class="field"><label>Cartella download</label><input id="sDest" spellcheck="false"></div>
+    <div class="field"><label>Qualità predefinita</label>
+      <select id="sQuality">
+        <option value="1080">1080p — H.264 (per DaVinci)</option>
+        <option value="720">720p — H.264</option>
+        <option value="best">Massima qualità H.264</option>
+        <option value="max">Massima assoluta (VP9/AV1)</option>
+        <option value="audio">Solo audio (m4a)</option>
+      </select></div>
+    <div class="field"><label>Login predefinito (cookie dal browser)</label>
+      <select id="sBrowser">
+        <option value="none">Senza login</option>
+        <option value="chrome">Chrome</option>
+        <option value="safari">Safari</option>
+        <option value="firefox">Firefox</option>
+      </select></div>
+    <div class="cols">
+      <div class="field"><label>Download simultanei (1–6)</label><input id="sConc" type="number" min="1" max="6"></div>
+      <div class="field"><label>Connessioni per video (1–8)</label><input id="sFrag" type="number" min="1" max="8"></div>
+    </div>
+    <div class="sheetacts">
+      <button class="ghost" onclick="closeSettings()">Annulla</button>
+      <button class="go" onclick="saveSettings()">Salva</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const TOKEN = '__TOKEN__';
@@ -476,24 +649,135 @@ async function api(path, body){
   return (await fetch(path, opt)).json();
 }
 
+function esc(s){ return (''+(s??'')).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function attr(v){ return esc(JSON.stringify(v)); }
+function cls(s){ return s==='fatto'?'fatto':s==='errore'?'errore':'attivo'; }
+
+// ------------------------------------------------------ azioni principali
 async function add(){
   const urls = $('#urls').value.split('\n').filter(u=>u.trim());
   if(!urls.length) return;
   const body = { urls, quality:$('#quality').value, browser:$('#browser').value };
   if($('#useInterval').checked){ body.start=$('#start').value.trim(); body.end=$('#end').value.trim(); }
   await api('/api/add', body);
-  $('#urls').value=''; refresh();
+  // Con la preview attiva l'URL resta: comodo per scaricare più segmenti
+  $('#urls').value = pvId ? $('#urls').value.split('\n')[0] : '';
+  checkPreview(); refresh();
 }
 function openFolder(){ api('/api/open_folder',{}); }
 function openFile(p,reveal){ api('/api/open',{path:p,reveal}); }
-function redownload(url){ $('#urls').value = url; window.scrollTo({top:0,behavior:'smooth'}); $('#urls').focus(); }
+function redownload(url){ $('#urls').value = url; checkPreview(); window.scrollTo({top:0,behavior:'smooth'}); $('#urls').focus(); }
 async function quitApp(){ await api('/api/quit',{}); document.body.innerHTML='<div class="wrap"><p class="empty">Chiuso. Puoi chiudere questa finestra.</p></div>'; }
 
-function esc(s){ return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function attr(v){ return esc(JSON.stringify(v)); }
-function cls(s){ return s==='fatto'?'fatto':s==='errore'?'errore':'attivo'; }
+// ------------------------------------------------- preview YouTube: IN/OUT
+let pvId = null, ytTime = 0;
+function ytIdOf(u){
+  const m = (u||'').match(/(?:youtube\.com\/(?:watch\?[^\s]*v=|shorts\/|live\/|embed\/)|youtu\.be\/)([\w-]{11})/);
+  return m ? m[1] : null;
+}
+function checkPreview(){
+  const id = ytIdOf(($('#urls').value.split('\n')[0]||'').trim());
+  if(id === pvId) return;
+  pvId = id; ytTime = 0;
+  if(id){
+    $('#yt').src = `https://www.youtube.com/embed/${id}?enablejsapi=1&rel=0&origin=${encodeURIComponent(location.origin)}`;
+    $('#pv').classList.add('on');
+  } else {
+    $('#yt').src = 'about:blank';
+    $('#pv').classList.remove('on');
+    $('#inV').textContent = $('#outV').textContent = '—';
+  }
+}
+window.addEventListener('message', e=>{
+  if(e.origin!=='https://www.youtube.com') return;
+  let d; try{ d = JSON.parse(e.data); }catch(_){ return; }
+  if(d.event==='infoDelivery' && d.info && typeof d.info.currentTime==='number') ytTime = d.info.currentTime;
+});
+$('#yt').addEventListener('load', ()=>{
+  // Handshake col player: da qui in poi manda i suoi infoDelivery (currentTime)
+  const hi = ()=>{ try{ $('#yt').contentWindow.postMessage(JSON.stringify({event:'listening', id:'sv', channel:'widget'}), '*'); }catch(_){} };
+  hi(); setTimeout(hi, 800); setTimeout(hi, 2500);
+});
+function fmtT(t){
+  t = Math.max(0, Math.round(t));
+  const p = n => String(n).padStart(2,'0');
+  const h = (t/3600)|0, m = ((t%3600)/60)|0, s = t%60;
+  return h ? `${h}:${p(m)}:${p(s)}` : `${m}:${p(s)}`;
+}
+function enableInterval(){ $('#useInterval').checked = true; $('#iv').classList.add('on'); }
+function setIn(){ if(!pvId) return; const v = fmtT(Math.floor(ytTime)); $('#start').value = v; $('#inV').textContent = v; enableInterval(); }
+function setOut(){ if(!pvId) return; const v = fmtT(Math.ceil(ytTime)); $('#end').value = v; $('#outV').textContent = v; enableInterval(); }
+document.addEventListener('keydown', e=>{
+  if(e.key==='Escape'){ closeSettings(); return; }
+  if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || !pvId) return;
+  if(e.key==='i'||e.key==='I'){ e.preventDefault(); setIn(); }
+  if(e.key==='o'||e.key==='O'){ e.preventDefault(); setOut(); }
+});
 
+// ------------------------------------------------------ cartella download
+function fmtSize(b){ return b>=1e9 ? (b/1e9).toFixed(2)+' GB' : b>=1e6 ? (b/1e6).toFixed(1)+' MB' : Math.max(1,Math.round(b/1e3))+' KB'; }
+function fmtDate(t){ const d = new Date(t*1000);
+  return d.toLocaleDateString('it-IT',{day:'numeric',month:'short'})+' '+d.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'}); }
+async function loadFiles(){
+  const fs = await api('/api/files');
+  $('#fmCount').textContent = fs.length ? fs.length+' file · trascinali in DaVinci' : '';
+  $('#files').innerHTML = fs.length ? fs.map(f=>`
+    <div class="frow">
+      <a class="fname" draggable="true" href="file://${esc(encodeURI(f.path))}"
+         ondragstart='dragFile(event,${attr(f.path)})' onclick="return false"
+         ondblclick='openFile(${attr(f.path)},false)' title="${esc(f.name)} — doppio click per aprire">${esc(f.name)}</a>
+      <span class="fmeta">${fmtSize(f.size)} · ${fmtDate(f.mtime)}</span>
+      <button class="chip" onclick='openFile(${attr(f.path)},true)'>Finder</button>
+    </div>`).join('') : '<div class="empty">Cartella vuota.</div>';
+}
+function dragFile(e,p){
+  const u = 'file://'+encodeURI(p);
+  e.dataTransfer.setData('text/uri-list', u);
+  e.dataTransfer.setData('text/plain', p);
+  e.dataTransfer.effectAllowed = 'copy';
+}
+function toggleFm(){ $('#fm').classList.toggle('closed'); }
+
+// ----------------------------------------------------------- impostazioni
+function openSettings(){
+  api('/api/settings').then(s=>{
+    $('#sDest').value = s.dest; $('#sQuality').value = s.quality; $('#sBrowser').value = s.browser;
+    $('#sConc').value = s.concurrent; $('#sFrag').value = s.fragments;
+    $('#ovl').classList.add('on');
+  });
+}
+function closeSettings(){ $('#ovl').classList.remove('on'); }
+async function saveSettings(){
+  const r = await api('/api/settings', { dest:$('#sDest').value.trim(),
+    quality:$('#sQuality').value, browser:$('#sBrowser').value,
+    concurrent:$('#sConc').value, fragments:$('#sFrag').value });
+  if(!r.ok){ alert(r.error||'Impossibile salvare'); return; }
+  applyDefaults(r); closeSettings(); loadFiles();
+}
+function applyDefaults(s){
+  $('#quality').value = s.quality; $('#browser').value = s.browser;
+  $('#fmTitle').textContent = s.dest.replace(/^\/Users\/[^/]+/, '~');
+}
+
+// ----------------------------------------------------------------- polling
 let lastDone = null;
+
+async function loadHistory(){
+  const hist = await api('/api/history');
+  $('#history').innerHTML = hist.length ? hist.map(h=>{
+    const ok = h.status==='fatto';
+    const open = ok && h.filepath ? `<button class="chip" onclick='openFile(${attr(h.filepath)},false)'>Apri</button>
+        <button class="chip" onclick='openFile(${attr(h.filepath)},true)'>Finder</button>` : '';
+    return `<div class="hrow ${cls(h.status)}">
+      <div class="info">
+        <div class="name">${esc(h.title||h.url)}</div>
+        <div class="meta">${esc(h.created)} · ${esc(h.quality||'')}${h.section?(' · '+esc(h.section)):''}${h.note?(' · '+esc(h.note)):''}${h.error?(' · '+esc(h.error)):''}</div>
+      </div>
+      <div class="acts">${open}
+        <button class="chip" onclick='redownload(${attr(h.url)})'>Ri-scarica</button>
+      </div></div>`;
+  }).join('') : '<div class="empty">Ancora niente.</div>';
+}
 
 async function refresh(){
   const r = await api('/api/jobs');
@@ -510,27 +794,15 @@ async function refresh(){
       <div class="track"><div class="fill" style="width:${j.progress}%"></div></div></div>`;
   }).join('');
 
-  // La cronologia cambia solo quando un job finisce: ricaricala solo allora
+  // Cronologia e cartella cambiano solo quando un job finisce
   if(r.done !== lastDone){
     lastDone = r.done;
-    const hist = await api('/api/history');
-    $('#history').innerHTML = hist.length ? hist.map(h=>{
-      const ok = h.status==='fatto';
-      const open = ok && h.filepath ? `<button class="chip" onclick='openFile(${attr(h.filepath)},false)'>Apri</button>
-          <button class="chip" onclick='openFile(${attr(h.filepath)},true)'>Finder</button>` : '';
-      return `<div class="hrow ${cls(h.status)}">
-        <div class="info">
-          <div class="name">${esc(h.title||h.url)}</div>
-          <div class="meta">${esc(h.created)} · ${esc(h.quality||'')}${h.section?(' · '+esc(h.section)):''}${h.note?(' · '+esc(h.note)):''}${h.error?(' · '+esc(h.error)):''}</div>
-        </div>
-        <div class="acts">${open}
-          <button class="chip" onclick='redownload(${attr(h.url)})'>Ri-scarica</button>
-        </div></div>`;
-    }).join('') : '<div class="empty">Ancora niente. I file finiscono in ~/Movies/Scarica Video.</div>';
+    loadHistory(); loadFiles();
   }
 
   clearTimeout(window._t); window._t = setTimeout(refresh, active.length?800:4000);
 }
+api('/api/settings').then(applyDefaults);
 refresh();
 </script></div></body></html>"""
 
@@ -560,6 +832,7 @@ def start_server():
 
 if __name__ == "__main__":
     init_db()
+    load_config()
     os.makedirs(DEST, exist_ok=True)
     url = f"http://127.0.0.1:{PORT}/"
     # Avvia il server; se la porta è occupata un'istanza è già attiva -> apri solo la finestra

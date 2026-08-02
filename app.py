@@ -858,42 +858,94 @@ async function refresh(){
 }
 api('/api/settings').then(applyDefaults);
 refresh();
+// Segnala al backend quando il ponte pywebview è pronto (diagnostica +
+// installa il monitor eventi per il drag nativo)
+(function waitBridge(n){
+  if(window.pywebview && window.pywebview.api && window.pywebview.api.ping){
+    window.pywebview.api.ping();
+  } else if(n < 20){ setTimeout(()=>waitBridge(n+1), 500); }
+})(0);
 </script></div></body></html>"""
 
 
 def make_js_api():
     """API esposta alla pagina da pywebview. start_drag avvia un drag nativo
     macOS (NSDraggingSession) col file vero: il drag HTML5 di WKWebView non
-    viene riconosciuto da app come DaVinci, questo sì."""
-    from AppKit import (NSApp, NSDraggingItem, NSDragOperationCopy, NSObject,
-                        NSURL, NSWorkspace)
+    viene riconosciuto da app come DaVinci, questo sì. Un event monitor
+    locale conserva l'ultimo evento mouse reale: la chiamata dal JS arriva
+    in modo asincrono e NSApp.currentEvent() a quel punto non è affidabile."""
+    from AppKit import (NSApp, NSDraggingItem, NSDragOperationCopy, NSEvent,
+                        NSEventMaskLeftMouseDown, NSEventMaskLeftMouseDragged,
+                        NSEventTypeLeftMouseDown, NSEventTypeLeftMouseDragged,
+                        NSObject, NSURL, NSWorkspace)
     from PyObjCTools import AppHelper
+
+    log_path = os.path.join(SUPPORT, "drag.log")
+
+    def dlog(msg):
+        try:
+            with open(log_path, "a") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except OSError:
+            pass
 
     class _DragSource(NSObject):
         def draggingSession_sourceOperationMaskForDraggingContext_(self, s, c):
             return NSDragOperationCopy
 
     source = _DragSource.alloc().init()
+    state = {"event": None, "monitor": None}
+
+    def install_monitor():
+        if state["monitor"] is not None:
+            return
+        def keep(event):
+            state["event"] = event
+            return event
+        mask = NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged
+        state["monitor"] = \
+            NSEvent.addLocalMonitorForEventsMatchingMask_handler_(mask, keep)
+        dlog("monitor eventi installato")
 
     class Api:
+        def install(self):
+            AppHelper.callAfter(install_monitor)
+
+        def ping(self):
+            dlog("bridge js ok")
+            AppHelper.callAfter(install_monitor)
+            return True
+
         def start_drag(self, path):
             real = os.path.realpath(str(path))
             base = os.path.realpath(DEST)
             if not real.startswith(base + os.sep) or not os.path.exists(real):
+                dlog(f"start_drag rifiutato: {path}")
                 return False
+            dlog(f"start_drag: {os.path.basename(real)}")
+            attempts = {"n": 0}
 
             def begin():
+                attempts["n"] += 1
+                install_monitor()
+                event = state["event"]
+                cur = NSApp.currentEvent()
+                if event is None and cur is not None and cur.type() in (
+                        NSEventTypeLeftMouseDown, NSEventTypeLeftMouseDragged):
+                    event = cur
+                if event is None or event.window() is None:
+                    dlog(f"tentativo {attempts['n']}: nessun evento mouse "
+                         f"(currentEvent={cur.type() if cur else None})")
+                    if attempts["n"] < 12:   # il drag è in corso: riprova
+                        AppHelper.callLater(0.04, begin)
+                    return
                 try:
                     from webview.platforms.cocoa import BrowserView
                     views = list(BrowserView.instances.values())
                     if not views:
+                        dlog("nessuna BrowserView")
                         return
                     wk = views[0].webkit
-                    # L'evento corrente è il mouse-drag in corso: è quello che
-                    # serve per agganciare la sessione di drag
-                    event = NSApp.currentEvent()
-                    if event is None or event.window() is None:
-                        return
                     url = NSURL.fileURLWithPath_(real)
                     item = NSDraggingItem.alloc().initWithPasteboardWriter_(url)
                     icon = NSWorkspace.sharedWorkspace().iconForFile_(real)
@@ -902,8 +954,9 @@ def make_js_api():
                         ((pt.x - 16, pt.y - 16), (32, 32)), icon)
                     wk.beginDraggingSessionWithItems_event_source_(
                         [item], event, source)
-                except Exception:
-                    pass
+                    dlog("sessione di drag avviata")
+                except Exception as e:
+                    dlog(f"errore beginDraggingSession: {e}")
 
             AppHelper.callAfter(begin)
             return True

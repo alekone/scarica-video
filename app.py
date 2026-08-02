@@ -178,7 +178,8 @@ def finish_job(job):
 def load_history(limit=200):
     with db() as conn:
         rows = conn.execute(
-            "SELECT * FROM history ORDER BY created DESC LIMIT ?", (limit,)
+            "SELECT * FROM history ORDER BY created DESC, rowid DESC LIMIT ?",
+            (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -359,7 +360,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self):
         length = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(length) or b"{}")
+        try:
+            data = json.loads(self.rfile.read(length) or b"{}")
+            return data if isinstance(data, dict) else {}
+        except (ValueError, UnicodeDecodeError):
+            return {}
 
     def _authed(self):
         if self.headers.get("X-Token") == TOKEN:

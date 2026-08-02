@@ -23,12 +23,29 @@ PORT = 8642
 DEST = os.path.expanduser("~/Movies/Scarica Video")
 SUPPORT = os.path.expanduser("~/Library/Application Support/Scarica Video")
 DB_PATH = os.path.join(SUPPORT, "history.db")
-YTDLP = shutil.which("yt-dlp") or "/opt/homebrew/bin/yt-dlp"
-GDL = shutil.which("gallery-dl") or "/opt/homebrew/bin/gallery-dl"
+
+
+def find_bin(name):
+    path = shutil.which(name)
+    if path:
+        return path
+    for d in ("/opt/homebrew/bin", "/usr/local/bin"):  # Apple Silicon / Intel
+        cand = os.path.join(d, name)
+        if os.path.exists(cand):
+            return cand
+    return name
+
+
+YTDLP = find_bin("yt-dlp")
+GDL = find_bin("gallery-dl")
 MAX_CONCURRENT = 3
+# Token per-avvio: le API rispondono solo alla nostra pagina, non ad altri
+# siti aperti nel browser (CSRF su 127.0.0.1)
+TOKEN = uuid.uuid4().hex
 
 jobs = {}
 jobs_order = []
+done_count = 0
 lock = threading.Lock()
 slots = threading.Semaphore(MAX_CONCURRENT)
 db_lock = threading.Lock()
@@ -38,8 +55,11 @@ SPEED_RE = re.compile(r"at\s+([\d.]+\s*[KMGT]?i?B/s|Unknown[^\s]*)")
 ETA_RE = re.compile(r"ETA\s+([\d:]+)")
 SIZE_RE = re.compile(r"of\s+~?\s*([\d.]+\s*[KMGT]?i?B)")
 DEST_RE = re.compile(
-    r'(?:Destination:|Merging formats into|has already been downloaded)\s*"?'
+    r'(?:Destination:|Merging formats into)\s*"?'
     r'((?:/[^"\n]+?)\.(?:mp4|m4a|webm|mkv|mp3|mov))"?'
+)
+ALREADY_RE = re.compile(
+    r"(/[^\n]+?\.(?:mp4|m4a|webm|mkv|mp3|mov)) has already been downloaded"
 )
 
 
@@ -66,18 +86,35 @@ def init_db():
                 created   TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(history)")]
+        if "note" not in cols:
+            conn.execute("ALTER TABLE history ADD COLUMN note TEXT")
 
 
 def save_history(job):
     with db_lock, db() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO history "
-            "(id,url,title,filepath,quality,section,status,error) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "(id,url,title,filepath,quality,section,status,error,note) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (job["id"], job["url"], job.get("file"), job.get("filepath"),
              job.get("quality"), job.get("section") or "", job["status"],
-             job.get("error")),
+             job.get("error"), job.get("note")),
         )
+
+
+def finish_job(job):
+    """Salva in cronologia e toglie il job dalla memoria (il polling non deve
+    ritrasmettere per sempre i job conclusi)."""
+    global done_count
+    save_history(job)
+    with lock:
+        done_count += 1
+        jobs.pop(job["id"], None)
+        try:
+            jobs_order.remove(job["id"])
+        except ValueError:
+            pass
 
 
 def load_history(limit=200):
@@ -128,9 +165,15 @@ def run_job(job_id):
             job = jobs[job_id]
             job["status"] = "in corso"
         browser = job.get("browser", "none")
+        # Il minutaggio entra nel nome file: tagli diversi dello stesso video
+        # non collidono col file intero (yt-dlp salterebbe il download)
+        outtmpl = "%(title).80s [%(id)s]"
+        if job.get("section"):
+            tag = job["section"].lstrip("*").replace(":", ".").replace("/", "-")
+            outtmpl += f" [taglio {tag}]"
         while True:
-            args = [YTDLP, "--newline", "--no-playlist",
-                    "-o", os.path.join(DEST, "%(title).80s [%(id)s].%(ext)s")]
+            args = [YTDLP, "--newline", "--no-playlist", "-N", "4",
+                    "-o", os.path.join(DEST, outtmpl + ".%(ext)s")]
             if browser != "none":
                 args += ["--cookies-from-browser", browser]
             if job.get("section"):
@@ -165,15 +208,22 @@ def run_job(job_id):
                         if m:
                             job["filepath"] = m.group(1)
                             job["file"] = os.path.basename(m.group(1))
+                        m = ALREADY_RE.search(line)
+                        if m:
+                            job["filepath"] = m.group(1)
+                            job["file"] = os.path.basename(m.group(1))
+                            job["note"] = "file già presente — non riscaricato"
                 proc.wait()
                 if proc.returncode == 0:
                     with lock:
                         job["status"] = "fatto"
                         job["progress"] = 100.0
                         job["speed"] = job["eta"] = None
-                    save_history(job)
+                    finish_job(job)
                     return
                 error = tail[-1] if tail else f"exit {proc.returncode}"
+            except FileNotFoundError:
+                error = "yt-dlp non trovato — installa con: brew install yt-dlp ffmpeg"
             except Exception as e:
                 error = str(e)
 
@@ -192,7 +242,7 @@ def run_job(job_id):
                     else:
                         job["status"] = "errore"
                         job["error"] = "gallery-dl non ha scaricato nulla"
-                save_history(job)
+                finish_job(job)
                 return
 
             # TikTok & co.: se serve il login, riprova coi cookie di Chrome
@@ -206,7 +256,7 @@ def run_job(job_id):
             with lock:
                 job["status"] = "errore"
                 job["error"] = error
-            save_history(job)
+            finish_job(job)
             return
 
 
@@ -224,7 +274,8 @@ def add_jobs(urls, quality, browser, section):
                             "browser": job_browser, "section": section,
                             "status": "in coda", "progress": 0.0,
                             "speed": None, "eta": None, "size": None,
-                            "file": None, "filepath": None, "error": None}
+                            "file": None, "filepath": None, "error": None,
+                            "note": None}
             jobs_order.insert(0, job_id)
         threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
         added += 1
@@ -251,20 +302,34 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def _authed(self):
+        if self.headers.get("X-Token") == TOKEN:
+            return True
+        self._send({"error": "non autorizzato"}, code=403)
+        return False
+
     def do_GET(self):
         if self.path == "/":
-            self._send(HTML, "text/html; charset=utf-8")
+            self._send(HTML.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
         elif self.path == "/ping":
             self._send("ok", "text/plain")
+        elif not self._authed():
+            return
         elif self.path == "/api/jobs":
+            # Copia sotto lock, invio fuori: un client lento non deve
+            # bloccare i thread di download
             with lock:
-                self._send([jobs[j] for j in jobs_order])
+                data = {"done": done_count,
+                        "jobs": [dict(jobs[j]) for j in jobs_order]}
+            self._send(data)
         elif self.path == "/api/history":
             self._send(load_history())
         else:
             self.send_error(404)
 
     def do_POST(self):
+        if not self._authed():
+            return
         if self.path == "/api/add":
             d = self._body()
             urls = [u.strip() for u in d.get("urls", []) if u.strip()]
@@ -276,8 +341,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"added": added})
         elif self.path == "/api/open":
             d = self._body()
-            path = d.get("path", "")
-            if path.startswith(DEST) and os.path.exists(path):
+            # realpath: niente "../" per uscire dalla cartella dei download
+            path = os.path.realpath(d.get("path", ""))
+            base = os.path.realpath(DEST)
+            if path.startswith(base + os.sep) and os.path.exists(path):
                 reveal = d.get("reveal")
                 subprocess.Popen(["open", "-R", path] if reveal else ["open", path])
                 self._send({"ok": True})
@@ -401,56 +468,68 @@ HTML = r"""<!doctype html>
 <h2>Cronologia</h2><div id="history"><div class="empty">Ancora niente. I file finiscono in ~/Movies/Scarica Video.</div></div>
 
 <script>
+const TOKEN = '__TOKEN__';
 const $ = s => document.querySelector(s);
-async function post(path, body){ return (await fetch(path,{method:'POST',body:JSON.stringify(body||{})})).json(); }
+async function api(path, body){
+  const opt = body===undefined ? {headers:{'X-Token':TOKEN}}
+    : {method:'POST', headers:{'X-Token':TOKEN}, body:JSON.stringify(body)};
+  return (await fetch(path, opt)).json();
+}
 
 async function add(){
   const urls = $('#urls').value.split('\n').filter(u=>u.trim());
   if(!urls.length) return;
   const body = { urls, quality:$('#quality').value, browser:$('#browser').value };
   if($('#useInterval').checked){ body.start=$('#start').value.trim(); body.end=$('#end').value.trim(); }
-  await post('/api/add', body);
+  await api('/api/add', body);
   $('#urls').value=''; refresh();
 }
-function openFolder(){ post('/api/open_folder'); }
-function openFile(p,reveal){ post('/api/open',{path:p,reveal}); }
+function openFolder(){ api('/api/open_folder',{}); }
+function openFile(p,reveal){ api('/api/open',{path:p,reveal}); }
 function redownload(url){ $('#urls').value = url; window.scrollTo({top:0,behavior:'smooth'}); $('#urls').focus(); }
-async function quitApp(){ await post('/api/quit'); document.body.innerHTML='<div class="wrap"><p class="empty">Chiuso. Puoi chiudere questa finestra.</p></div>'; }
+async function quitApp(){ await api('/api/quit',{}); document.body.innerHTML='<div class="wrap"><p class="empty">Chiuso. Puoi chiudere questa finestra.</p></div>'; }
 
-function esc(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function esc(s){ return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function attr(v){ return esc(JSON.stringify(v)); }
+function cls(s){ return s==='fatto'?'fatto':s==='errore'?'errore':'attivo'; }
+
+let lastDone = null;
 
 async function refresh(){
-  const jobs = await (await fetch('/api/jobs')).json();
-  const active = jobs.filter(j=>j.status!=='fatto'&&j.status!=='errore');
+  const r = await api('/api/jobs');
+  const active = r.jobs;
   $('#activeWrap').style.display = active.length ? 'block':'none';
   $('#active').innerHTML = active.map(j=>{
     const line = j.status==='in corso'
       ? `${j.progress.toFixed(0)}% ${j.speed?('· '+j.speed):''} ${j.eta?('· ETA '+j.eta):''} ${j.size?('· '+j.size):''}`
       : esc(j.status);
-    return `<div class="job ${j.status}">
+    return `<div class="job ${cls(j.status)}">
       <span class="badge">${esc(j.status.toUpperCase())}</span>
       <div class="name">${esc(j.file||j.url)}</div>
       <div class="meta">${line}</div>
       <div class="track"><div class="fill" style="width:${j.progress}%"></div></div></div>`;
   }).join('');
 
-  const hist = await (await fetch('/api/history')).json();
-  $('#history').innerHTML = hist.length ? hist.map(h=>{
-    const ok = h.status==='fatto';
-    const open = ok && h.filepath ? `<button class="chip" onclick='openFile(${JSON.stringify(h.filepath)},false)'>Apri</button>
-        <button class="chip" onclick='openFile(${JSON.stringify(h.filepath)},true)'>Finder</button>` : '';
-    return `<div class="hrow ${h.status}">
-      <div class="info">
-        <div class="name">${esc(h.title||h.url)}</div>
-        <div class="meta">${esc(h.created)} · ${esc(h.quality||'')}${h.section?(' · '+esc(h.section)):''}${h.error?(' · '+esc(h.error)):''}</div>
-      </div>
-      <div class="acts">${open}
-        <button class="chip" onclick='redownload(${JSON.stringify(h.url)})'>Ri-scarica</button>
-      </div></div>`;
-  }).join('') : '<div class="empty">Ancora niente. I file finiscono in ~/Movies/Scarica Video.</div>';
+  // La cronologia cambia solo quando un job finisce: ricaricala solo allora
+  if(r.done !== lastDone){
+    lastDone = r.done;
+    const hist = await api('/api/history');
+    $('#history').innerHTML = hist.length ? hist.map(h=>{
+      const ok = h.status==='fatto';
+      const open = ok && h.filepath ? `<button class="chip" onclick='openFile(${attr(h.filepath)},false)'>Apri</button>
+          <button class="chip" onclick='openFile(${attr(h.filepath)},true)'>Finder</button>` : '';
+      return `<div class="hrow ${cls(h.status)}">
+        <div class="info">
+          <div class="name">${esc(h.title||h.url)}</div>
+          <div class="meta">${esc(h.created)} · ${esc(h.quality||'')}${h.section?(' · '+esc(h.section)):''}${h.note?(' · '+esc(h.note)):''}${h.error?(' · '+esc(h.error)):''}</div>
+        </div>
+        <div class="acts">${open}
+          <button class="chip" onclick='redownload(${attr(h.url)})'>Ri-scarica</button>
+        </div></div>`;
+    }).join('') : '<div class="empty">Ancora niente. I file finiscono in ~/Movies/Scarica Video.</div>';
+  }
 
-  const busy = jobs.some(j=>j.status==='in coda'||j.status==='in corso'||j.status.startsWith('foto')||j.status.startsWith('riprovo'));
-  clearTimeout(window._t); window._t = setTimeout(refresh, busy?800:4000);
+  clearTimeout(window._t); window._t = setTimeout(refresh, active.length?800:4000);
 }
 refresh();
 </script></div></body></html>"""

@@ -7,8 +7,9 @@ Sotto il cofano usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp); il backend è 
 ## Funzioni
 
 - 🎬 **Multi-URL** — incolla tanti link insieme, uno per riga
-- ⏱️ **Intervallo DA → A** — scarica solo un pezzo del video, con taglio preciso ai keyframe (`--force-keyframes-at-cuts`)
-- 📊 **Progress bar** con percentuale, velocità ed ETA in tempo reale
+- ⏱️ **Intervallo DA → A** — scarica solo un pezzo del video, con taglio preciso ai keyframe (`--force-keyframes-at-cuts`); ogni taglio ha il minutaggio nel nome file, quindi tagli diversi dello stesso video convivono
+- 📊 **Progress bar** con percentuale, velocità ed ETA in tempo reale; download a frammenti paralleli (`-N 4`)
+- ♻️ **File già presente?** Nessun doppione silenzioso: la cronologia segnala "file già presente — non riscaricato"
 - 🕑 **Cronologia** persistente (SQLite): apri file, mostra nel Finder, ri-scarica
 - 🔐 **Login via cookie del browser** (Chrome/Safari/Firefox) per i siti che lo richiedono — TikTok, Instagram
 - 🖼️ **Foto e caroselli** — fallback automatico su [`gallery-dl`](https://github.com/mikf/gallery-dl) quando non c'è un video

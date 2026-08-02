@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -119,6 +120,35 @@ def list_files(limit=80):
                     "size": st.st_size, "mtime": st.st_mtime})
     out.sort(key=lambda f: -f["mtime"])
     return out[:limit]
+
+
+# ---------------------------------------------------------------- preview
+preview_cache = {}
+PREVIEW_TTL = 3 * 3600  # gli URL googlevideo scadono dopo ~6h
+
+
+def resolve_preview(url):
+    """URL diretto dello stream (mp4 progressivo <=480p) per il player della
+    preview. L'embed di YouTube dentro WKWebView mostra solo 'Watch on
+    YouTube', lo stream diretto invece si riproduce ovunque."""
+    cached = preview_cache.get(url)
+    if cached and time.time() - cached[0] < PREVIEW_TTL:
+        return cached[1]
+    args = [YTDLP, "--no-playlist", "-g", "-f",
+            "best[protocol^=http][vcodec^=avc1][acodec!=none][height<=480]"
+            "/18/best[protocol^=http][acodec!=none][height<=480]",
+            url]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    lines = out.stdout.strip().splitlines()
+    src = lines[0] if lines else None
+    if src:
+        preview_cache[url] = (time.time(), src)
+    return src
 
 
 # ---------------------------------------------------------------- database
@@ -422,6 +452,14 @@ class Handler(BaseHTTPRequestHandler):
             os.makedirs(DEST, exist_ok=True)
             subprocess.Popen(["open", DEST])
             self._send({"ok": True})
+        elif self.path == "/api/preview":
+            d = self._body()
+            u = str(d.get("url", "")).strip()
+            if not u.startswith("http"):
+                self._send({"ok": False, "error": "url non valido"}, code=400)
+                return
+            src = resolve_preview(u)
+            self._send({"ok": bool(src), "src": src})
         elif self.path == "/api/settings":
             d = self._body()
             dest = os.path.expanduser(str(d.get("dest") or config["dest"]).strip()
@@ -527,7 +565,10 @@ HTML = r"""<!doctype html>
   .pv.on { display:block }
   .pvframe { position:relative; width:100%; aspect-ratio:16/9; background:#000;
     border-radius:11px; overflow:hidden }
-  .pvframe iframe { position:absolute; inset:0; width:100%; height:100%; border:0 }
+  .pvframe video { position:absolute; inset:0; width:100%; height:100%; border:0 }
+  .pvmsg { position:absolute; inset:0; display:flex; align-items:center;
+    justify-content:center; color:#fff; font-size:13px; text-align:center;
+    padding:0 20px; background:rgba(0,0,0,.6) }
   .pvbar { display:flex; gap:9px; align-items:center; margin-top:9px; flex-wrap:wrap }
   .fm { position:fixed; left:0; right:0; bottom:0; z-index:40; background:var(--card);
     border-top:1px solid var(--line) }
@@ -593,11 +634,14 @@ HTML = r"""<!doctype html>
     <span class="dot">formato mm:ss · taglio preciso ai keyframe</span>
   </div>
   <div class="pv" id="pv">
-    <div class="pvframe"><iframe id="yt" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe></div>
+    <div class="pvframe">
+      <video id="yt" controls playsinline preload="metadata"></video>
+      <div class="pvmsg" id="pvMsg">Carico la preview…</div>
+    </div>
     <div class="pvbar">
       <button class="chip" onclick="setIn()"><kbd>I</kbd> IN <span id="inV">—</span></button>
       <button class="chip" onclick="setOut()"><kbd>O</kbd> OUT <span id="outV">—</span></button>
-      <span class="dot">pausa sul punto giusto, poi I / O · clicca fuori dal player per usare la tastiera</span>
+      <span class="dot">fermati sul punto giusto e premi I (inizio) e O (fine), come in DaVinci</span>
     </div>
   </div>
 </div>
@@ -675,34 +719,32 @@ function redownload(url){ $('#urls').value = url; checkPreview(); window.scrollT
 async function quitApp(){ await api('/api/quit',{}); document.body.innerHTML='<div class="wrap"><p class="empty">Chiuso. Puoi chiudere questa finestra.</p></div>'; }
 
 // ------------------------------------------------- preview YouTube: IN/OUT
-let pvId = null, ytTime = 0;
+// Niente iframe embedded (in WKWebView mostra solo "Watch on YouTube"):
+// yt-dlp risolve l'URL diretto dello stream e lo riproduce un <video> nativo
+let pvId = null, pvReq = 0;
 function ytIdOf(u){
   const m = (u||'').match(/(?:youtube\.com\/(?:watch\?[^\s]*v=|shorts\/|live\/|embed\/)|youtu\.be\/)([\w-]{11})/);
   return m ? m[1] : null;
 }
+function pvMsg(t){ const m = $('#pvMsg'); m.textContent = t; m.style.display = t ? 'flex' : 'none'; }
 function checkPreview(){
-  const id = ytIdOf(($('#urls').value.split('\n')[0]||'').trim());
+  const first = ($('#urls').value.split('\n')[0]||'').trim();
+  const id = ytIdOf(first);
   if(id === pvId) return;
-  pvId = id; ytTime = 0;
-  if(id){
-    $('#yt').src = `https://www.youtube.com/embed/${id}?enablejsapi=1&rel=0&origin=${encodeURIComponent(location.origin)}`;
-    $('#pv').classList.add('on');
-  } else {
-    $('#yt').src = 'about:blank';
-    $('#pv').classList.remove('on');
-    $('#inV').textContent = $('#outV').textContent = '—';
-  }
+  pvId = id;
+  const v = $('#yt');
+  v.pause(); v.removeAttribute('src'); v.load();
+  $('#inV').textContent = $('#outV').textContent = '—';
+  if(!id){ $('#pv').classList.remove('on'); return; }
+  $('#pv').classList.add('on');
+  pvMsg('Carico la preview…');
+  const my = ++pvReq;
+  api('/api/preview', {url: first}).then(r=>{
+    if(my !== pvReq) return;               // nel frattempo l'URL è cambiato
+    if(r.ok && r.src){ v.src = r.src; pvMsg(''); }
+    else pvMsg('Preview non disponibile per questo video — imposta DA e A a mano');
+  }).catch(()=>{ if(my === pvReq) pvMsg('Preview non disponibile — imposta DA e A a mano'); });
 }
-window.addEventListener('message', e=>{
-  if(e.origin!=='https://www.youtube.com') return;
-  let d; try{ d = JSON.parse(e.data); }catch(_){ return; }
-  if(d.event==='infoDelivery' && d.info && typeof d.info.currentTime==='number') ytTime = d.info.currentTime;
-});
-$('#yt').addEventListener('load', ()=>{
-  // Handshake col player: da qui in poi manda i suoi infoDelivery (currentTime)
-  const hi = ()=>{ try{ $('#yt').contentWindow.postMessage(JSON.stringify({event:'listening', id:'sv', channel:'widget'}), '*'); }catch(_){} };
-  hi(); setTimeout(hi, 800); setTimeout(hi, 2500);
-});
 function fmtT(t){
   t = Math.max(0, Math.round(t));
   const p = n => String(n).padStart(2,'0');
@@ -710,8 +752,8 @@ function fmtT(t){
   return h ? `${h}:${p(m)}:${p(s)}` : `${m}:${p(s)}`;
 }
 function enableInterval(){ $('#useInterval').checked = true; $('#iv').classList.add('on'); }
-function setIn(){ if(!pvId) return; const v = fmtT(Math.floor(ytTime)); $('#start').value = v; $('#inV').textContent = v; enableInterval(); }
-function setOut(){ if(!pvId) return; const v = fmtT(Math.ceil(ytTime)); $('#end').value = v; $('#outV').textContent = v; enableInterval(); }
+function setIn(){ if(!pvId) return; const v = fmtT(Math.floor($('#yt').currentTime||0)); $('#start').value = v; $('#inV').textContent = v; enableInterval(); }
+function setOut(){ if(!pvId) return; const v = fmtT(Math.ceil($('#yt').currentTime||0)); $('#end').value = v; $('#outV').textContent = v; enableInterval(); }
 document.addEventListener('keydown', e=>{
   if(e.key==='Escape'){ closeSettings(); return; }
   if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || !pvId) return;
@@ -736,6 +778,13 @@ async function loadFiles(){
     </div>`).join('') : '<div class="empty">Cartella vuota.</div>';
 }
 function dragFile(e,p){
+  if(window.pywebview && window.pywebview.api && window.pywebview.api.start_drag){
+    // App nativa: annulla il drag HTML5 (DaVinci non lo accetta) e avvia
+    // un drag macOS vero via NSDraggingSession
+    e.preventDefault();
+    window.pywebview.api.start_drag(p);
+    return;
+  }
   const u = 'file://'+encodeURI(p);
   e.dataTransfer.setData('text/uri-list', u);
   e.dataTransfer.setData('text/plain', p);
@@ -812,6 +861,56 @@ refresh();
 </script></div></body></html>"""
 
 
+def make_js_api():
+    """API esposta alla pagina da pywebview. start_drag avvia un drag nativo
+    macOS (NSDraggingSession) col file vero: il drag HTML5 di WKWebView non
+    viene riconosciuto da app come DaVinci, questo sì."""
+    from AppKit import (NSApp, NSDraggingItem, NSDragOperationCopy, NSObject,
+                        NSURL, NSWorkspace)
+    from PyObjCTools import AppHelper
+
+    class _DragSource(NSObject):
+        def draggingSession_sourceOperationMaskForDraggingContext_(self, s, c):
+            return NSDragOperationCopy
+
+    source = _DragSource.alloc().init()
+
+    class Api:
+        def start_drag(self, path):
+            real = os.path.realpath(str(path))
+            base = os.path.realpath(DEST)
+            if not real.startswith(base + os.sep) or not os.path.exists(real):
+                return False
+
+            def begin():
+                try:
+                    from webview.platforms.cocoa import BrowserView
+                    views = list(BrowserView.instances.values())
+                    if not views:
+                        return
+                    wk = views[0].webkit
+                    # L'evento corrente è il mouse-drag in corso: è quello che
+                    # serve per agganciare la sessione di drag
+                    event = NSApp.currentEvent()
+                    if event is None or event.window() is None:
+                        return
+                    url = NSURL.fileURLWithPath_(real)
+                    item = NSDraggingItem.alloc().initWithPasteboardWriter_(url)
+                    icon = NSWorkspace.sharedWorkspace().iconForFile_(real)
+                    pt = wk.convertPoint_fromView_(event.locationInWindow(), None)
+                    item.setDraggingFrame_contents_(
+                        ((pt.x - 16, pt.y - 16), (32, 32)), icon)
+                    wk.beginDraggingSessionWithItems_event_source_(
+                        [item], event, source)
+                except Exception:
+                    pass
+
+            AppHelper.callAfter(begin)
+            return True
+
+    return Api()
+
+
 def set_mac_identity():
     """Icona nel Dock/Cmd-Tab e nome dell'app, anche girando dentro un venv."""
     try:
@@ -848,8 +947,12 @@ if __name__ == "__main__":
     try:
         import webview
         set_mac_identity()
+        try:
+            api = make_js_api()
+        except Exception:
+            api = None           # niente drag nativo, resta il fallback HTML5
         webview.create_window("Scarica Video", url, width=780, height=920,
-                              min_size=(560, 640))
+                              min_size=(560, 640), js_api=api)
         webview.start()          # blocca finché la finestra resta aperta; chiusura = uscita
     except ImportError:
         # Nessun pywebview (uso da riga di comando): resta come server headless

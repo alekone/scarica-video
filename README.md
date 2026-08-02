@@ -7,9 +7,9 @@ Sotto il cofano usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp); il backend è 
 ## Funzioni
 
 - 🎬 **Multi-URL** — incolla tanti link insieme, uno per riga
-- 🎯 **Preview YouTube con IN/OUT** — incolli un link YouTube e appare il player: metti in pausa sul punto giusto e premi <kbd>I</kbd> (inizio) e <kbd>O</kbd> (fine) come in DaVinci, i campi DA/A si riempiono da soli
+- 🎯 **Preview YouTube con IN/OUT** — incolli un link YouTube e parte la preview (stream diretto risolto da yt-dlp, funziona anche coi video che bloccano l'embed): fermati sul punto giusto e premi <kbd>I</kbd> (inizio) e <kbd>O</kbd> (fine) come in DaVinci, i campi DA/A si riempiono da soli
 - ⏱️ **Intervallo DA → A** — scarica solo un pezzo del video, con taglio preciso ai keyframe (`--force-keyframes-at-cuts`); ogni taglio ha il minutaggio nel nome file, quindi tagli diversi dello stesso video convivono
-- 📁 **Mini file-manager** ancorato in basso: i file scaricati sono lì, pronti da trascinare direttamente nella media pool di DaVinci
+- 📁 **Mini file-manager** ancorato in basso: i file scaricati sono lì, pronti da trascinare direttamente nella media pool di DaVinci (drag nativo macOS, come dal Finder)
 - ⚙️ **Impostazioni** — cartella di destinazione, qualità e login predefiniti, download simultanei e connessioni per video (salvate in `config.json`)
 - 📊 **Progress bar** con percentuale, velocità ed ETA in tempo reale; download a frammenti paralleli
 - ♻️ **File già presente?** Nessun doppione silenzioso: la cronologia segnala "file già presente — non riscaricato"

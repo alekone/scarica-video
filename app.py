@@ -8,6 +8,8 @@ YouTube, TikTok, Instagram e centinaia di altri siti. Solo Python stdlib.
 - Cronologia persistente (SQLite) con apri file / mostra nel Finder / ri-scarica
 - Login via cookie del browser per i siti che lo richiedono (TikTok, Instagram)
 - Fallback su gallery-dl per foto e caroselli
+- Trascrizione locale con speaker (whisper.cpp + diarizzazione sherpa-onnx),
+  anche di video/audio già sul Mac (scelti col file picker nativo)
 """
 import json
 import os
@@ -15,8 +17,12 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
+import tarfile
+import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -27,6 +33,11 @@ DB_PATH = os.path.join(SUPPORT, "history.db")
 
 
 def find_bin(name):
+    # Prima il venv dell'app: yt-dlp lì dentro ha curl_cffi (impersonificazione
+    # browser, serve a TikTok & co.) ed è aggiornabile senza toccare Homebrew
+    cand = os.path.join(SUPPORT, "venv", "bin", name)
+    if os.path.exists(cand):
+        return cand
     path = shutil.which(name)
     if path:
         return path
@@ -39,13 +50,16 @@ def find_bin(name):
 
 YTDLP = find_bin("yt-dlp")
 GDL = find_bin("gallery-dl")
+FFMPEG = find_bin("ffmpeg")
+WHISPER = find_bin("whisper-cli")
 # Token per-avvio: le API rispondono solo alla nostra pagina, non ad altri
 # siti aperti nel browser (CSRF su 127.0.0.1)
 TOKEN = uuid.uuid4().hex
 
 CONFIG_PATH = os.path.join(SUPPORT, "config.json")
 CONFIG_DEFAULTS = {"dest": DEST, "quality": "1080", "browser": "none",
-                   "concurrent": 3, "fragments": 4}
+                   "concurrent": 3, "fragments": 4,
+                   "tlang": "auto", "tspeakers": "auto"}
 config = dict(CONFIG_DEFAULTS)
 _applied_concurrent = config["concurrent"]
 
@@ -97,55 +111,42 @@ def apply_config():
         _applied_concurrent = config["concurrent"]
 
 
-MEDIA_EXTS = (".mp4", ".m4a", ".webm", ".mkv", ".mp3", ".mov",
-              ".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif")
-
-
-def list_files(limit=80):
-    try:
-        entries = list(os.scandir(DEST))
-    except OSError:
-        return []
-    out = []
-    for e in entries:
-        if e.name.startswith(".") or not e.name.lower().endswith(MEDIA_EXTS):
-            continue
-        try:
-            if not e.is_file():
-                continue
-            st = e.stat()
-        except OSError:
-            continue
-        out.append({"name": e.name, "path": e.path,
-                    "size": st.st_size, "mtime": st.st_mtime})
-    out.sort(key=lambda f: -f["mtime"])
-    return out[:limit]
-
-
 # ---------------------------------------------------------------- preview
 preview_cache = {}
 PREVIEW_TTL = 3 * 3600  # gli URL googlevideo scadono dopo ~6h
 
 
 def resolve_preview(url):
-    """URL diretto dello stream (mp4 progressivo <=480p) per il player della
-    preview. L'embed di YouTube dentro WKWebView mostra solo 'Watch on
-    YouTube', lo stream diretto invece si riproduce ovunque."""
+    """URL riproducibile dal <video> della preview. YouTube non ha più formati
+    progressivi (video+audio in un file unico via http): si usa il manifest
+    HLS master, che WKWebView riproduce nativamente con audio e seek.
+    Fallback per altri siti: il miglior formato progressivo <=480p."""
     cached = preview_cache.get(url)
     if cached and time.time() - cached[0] < PREVIEW_TTL:
         return cached[1]
-    args = [YTDLP, "--no-playlist", "-g", "-f",
-            "best[protocol^=http][vcodec^=avc1][acodec!=none][height<=480]"
-            "/18/best[protocol^=http][acodec!=none][height<=480]",
-            url]
+    args = [YTDLP, "--no-playlist", "-j", url]
     try:
-        out = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        out = subprocess.run(args, capture_output=True, text=True, timeout=40)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if out.returncode != 0:
         return None
-    lines = out.stdout.strip().splitlines()
-    src = lines[0] if lines else None
+    try:
+        info = json.loads(out.stdout)
+    except ValueError:
+        return None
+    fmts = info.get("formats") or []
+    src = next((f.get("manifest_url") for f in fmts if f.get("manifest_url")),
+               None)
+    if not src:
+        prog = [f for f in fmts
+                if f.get("url") and str(f.get("protocol", "")).startswith("http")
+                and f.get("vcodec") not in (None, "none")
+                and f.get("acodec") not in (None, "none")]
+        prog.sort(key=lambda f: f.get("height") or 0)
+        low = [f for f in prog if (f.get("height") or 0) <= 480]
+        pick = (low or prog)[-1] if (low or prog) else None
+        src = pick["url"] if pick else None
     if src:
         preview_cache[url] = (time.time(), src)
     return src
@@ -214,6 +215,426 @@ def load_history(limit=200):
     return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------- trascrizione
+# Tutto in locale: whisper.cpp (Metal) trascrive con timestamp per parola,
+# sherpa-onnx riconosce chi parla quando (nessun account/token). I modelli si
+# scaricano una volta sola in Application Support. Output accanto al video:
+#   <nome>.transcript.txt   — leggibile, con speaker e timecode (per trovare i clip)
+#   <nome>.transcript.json  — parole con start/end (riutilizzabile in altri tool)
+MODELS_DIR = os.path.join(SUPPORT, "models")
+WHISPER_MODEL = "large-v3-turbo"
+WHISPER_URL = ("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+               f"ggml-{WHISPER_MODEL}.bin")
+# Release ufficiali k2-fsa/sherpa-onnx ("recongition" è il refuso del tag upstream)
+SEG_TAR_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+               "speaker-segmentation-models/"
+               "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2")
+EMB_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+           "speaker-recongition-models/"
+           "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx")
+SEG_MODEL = os.path.join(MODELS_DIR, "sherpa-onnx-pyannote-segmentation-3-0",
+                         "model.onnx")
+EMB_MODEL = os.path.join(MODELS_DIR, "embedding.onnx")
+TRANSCRIBE_EXTS = (".mp4", ".m4a", ".webm", ".mkv", ".mp3", ".mov")
+
+tjobs = {}
+tjobs_order = []
+t_slots = threading.Semaphore(1)   # la trascrizione satura la GPU: una alla volta
+WHISPER_PROG_RE = re.compile(r"progress\s*=\s*(\d+)%")
+
+
+def tset(job, **kw):
+    if "status" in kw:
+        kw["since"] = time.time()   # per mostrare in UI da quanto dura la fase
+    with lock:
+        job.update(kw)
+
+
+def download_file(url, dest, job):
+    """Scarica con progress sul job. Scrive su .part e rinomina alla fine."""
+    tmp = dest + ".part"
+
+    def hook(blocks, bs, total):
+        if total > 0:
+            tset(job, progress=min(100.0, blocks * bs * 100.0 / total))
+
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    urllib.request.urlretrieve(url, tmp, hook)
+    os.replace(tmp, dest)
+
+
+def ensure_whisper_model(job):
+    path = os.path.join(MODELS_DIR, f"ggml-{WHISPER_MODEL}.bin")
+    if not os.path.exists(path):
+        tset(job, status="scarico il modello di trascrizione (~1.6 GB, una volta sola)",
+             progress=0.0)
+        download_file(WHISPER_URL, path, job)
+    return path
+
+
+def ensure_diar_models(job):
+    if not os.path.exists(SEG_MODEL):
+        tset(job, status="scarico i modelli speaker (una volta sola)", progress=0.0)
+        with tempfile.NamedTemporaryFile(suffix=".tar.bz2", delete=False) as f:
+            tmp = f.name
+        try:
+            download_file(SEG_TAR_URL, tmp, job)
+            with tarfile.open(tmp, "r:bz2") as tf:
+                member = next(m for m in tf.getmembers()
+                              if m.name.endswith("/model.onnx"))
+                os.makedirs(os.path.dirname(SEG_MODEL), exist_ok=True)
+                with tf.extractfile(member) as src, open(SEG_MODEL, "wb") as out:
+                    shutil.copyfileobj(src, out)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    if not os.path.exists(EMB_MODEL):
+        tset(job, status="scarico i modelli speaker (una volta sola)", progress=0.0)
+        download_file(EMB_URL, EMB_MODEL, job)
+
+
+def ensure_python_deps(job):
+    """sherpa-onnx + numpy nel venv dell'app: installati al primo uso, così le
+    app già costruite funzionano senza rifare la build."""
+    try:
+        import sherpa_onnx  # noqa: F401
+        import numpy        # noqa: F401
+        return
+    except ImportError:
+        pass
+    tset(job, status="installo i componenti speaker (una volta sola)", progress=0.0)
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "--disable-pip-version-check", "sherpa-onnx", "numpy"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("installazione sherpa-onnx fallita: "
+                           + (r.stderr or r.stdout or "").strip()[-300:])
+    import importlib
+    importlib.invalidate_caches()
+
+
+def extract_audio(video, wav):
+    r = subprocess.run([FFMPEG, "-y", "-i", video, "-vn", "-ar", "16000",
+                        "-ac", "1", "-c:a", "pcm_s16le", wav],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("estrazione audio fallita: "
+                           + (r.stderr or "").strip().splitlines()[-1][:300])
+
+
+def run_whisper(wav, model, lang, out_base, job):
+    args = [WHISPER, "-m", model, "-f", wav, "-l", lang,
+            "-ojf", "-of", out_base, "-pp"]
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True)
+    tail = []
+    for line in proc.stderr:
+        line = line.rstrip()
+        if line:
+            tail.append(line)
+            tail = tail[-4:]
+        m = WHISPER_PROG_RE.search(line)
+        if m:
+            tset(job, progress=float(m.group(1)))
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError("whisper-cli fallito: " + (tail[-1] if tail else
+                                                      f"exit {proc.returncode}"))
+
+
+def tokens_to_words(full):
+    """Token whisper.cpp (-ojf) -> parole con start/end in secondi."""
+    words = []
+    for seg in full.get("transcription") or []:
+        for tok in seg.get("tokens") or []:
+            # token speciali: [_BEG_], [_EOT_], [_TT_488] (timestamp), ecc.
+            raw = re.sub(r"\[_[^\]]*\]", "", tok.get("text") or "")
+            if raw.strip() == "":
+                continue
+            offs = tok.get("offsets") or {}
+            start = (offs.get("from") or 0) / 1000
+            end = (offs.get("to") or 0) / 1000
+            if raw.startswith(" ") or not words:
+                words.append({"text": raw.strip(), "start": start, "end": end})
+            else:
+                words[-1]["text"] += raw
+                words[-1]["end"] = end
+    return [w for w in words if w["text"]]
+
+
+# Worker eseguito in un python separato: la chiamata nativa sd.process()
+# tiene il GIL per TUTTA la durata (minuti sui video lunghi) — dentro il
+# processo dell'app congelava UI e API senza alcun messaggio di errore.
+DIARIZE_WORKER = r'''
+import json, sys, wave
+import numpy as np
+import sherpa_onnx
+wav, n, seg_model, emb_model, out_path = (sys.argv[1], int(sys.argv[2]),
+                                          sys.argv[3], sys.argv[4], sys.argv[5])
+# NB: niente num_threads — il thread singolo e' la configurazione validata
+# (52 min di audio in ~6.5 min a macchina scarica). I tentativi multi-thread
+# non hanno mai avuto un benchmark pulito: con editor video o VM aperti
+# macOS relega questo worker sugli efficiency core e qualunque misura salta.
+config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+    segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+        pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+            model=seg_model),
+    ),
+    embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb_model),
+    # threshold alto = cluster piu' stabili: 0.5 spezzava la stessa voce
+    # in piu' speaker (testato su un servizio TV multi-voce)
+    clustering=sherpa_onnx.FastClusteringConfig(num_clusters=n, threshold=0.8),
+    min_duration_on=0.3,
+    min_duration_off=0.5,
+)
+sd = sherpa_onnx.OfflineSpeakerDiarization(config)
+with wave.open(wav, "rb") as w:
+    if w.getframerate() != sd.sample_rate:
+        raise SystemExit(f"sample rate {w.getframerate()} != {sd.sample_rate}")
+    frames = w.readframes(w.getnframes())
+samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+# Avanzamento su stderr (una riga per punto percentuale): l'app lo legge e
+# muove la barra — mai piu' fasi lunghe che sembrano bloccate
+last = [-1]
+def cb(processed, total):
+    pct = int(processed * 100 / max(1, total))
+    if pct != last[0]:
+        last[0] = pct
+        print(f"PROG {pct}", file=sys.stderr, flush=True)
+    return 0
+
+result = sd.process(samples, callback=cb).sort_by_start_time()
+with open(out_path, "w") as f:
+    json.dump([{"start": s.start, "end": s.end, "speaker": s.speaker}
+               for s in result], f)
+'''
+
+
+def diarize_wav(wav, num_speakers, on_progress=None):
+    """[{start,end,speaker}] con sherpa-onnx in un sottoprocesso.
+    num_speakers=-1 -> auto. on_progress(pct) via le righe PROG su stderr;
+    il risultato passa da file temporaneo (il JSON puo' superare il buffer
+    della pipe). Watchdog a 3 ore contro i processi zombie."""
+    out = os.path.join(tempfile.gettempdir(), f"diar-{uuid.uuid4().hex[:8]}.json")
+    p = subprocess.Popen([sys.executable, "-c", DIARIZE_WORKER, wav,
+                          str(num_speakers), SEG_MODEL, EMB_MODEL, out],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                         text=True)
+    watchdog = threading.Timer(3 * 3600, p.kill)
+    watchdog.daemon = True
+    watchdog.start()
+    tail = []
+    try:
+        for line in p.stderr:
+            line = line.strip()
+            if line.startswith("PROG "):
+                if on_progress:
+                    try:
+                        # la segmentazione copre ~il grosso del tempo: cap a 95,
+                        # il resto (embedding+cluster) chiude al "fatto"
+                        on_progress(min(95.0, float(line[5:])))
+                    except ValueError:
+                        pass
+            elif line:
+                tail.append(line)
+                tail = tail[-4:]
+        p.wait()
+    finally:
+        watchdog.cancel()
+    if p.returncode != 0:
+        raise RuntimeError("diarizzazione fallita: " + " ".join(tail)[-300:])
+    try:
+        with open(out) as f:
+            return json.load(f)
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def assign_speakers(words, segments):
+    """A ogni parola lo speaker del segmento che ne contiene il punto medio
+    (o, se nessuno, quello più vicino)."""
+    if not segments:
+        return
+    for w in words:
+        mid = (w["start"] + w["end"]) / 2
+        hit = next((s for s in segments if s["start"] <= mid < s["end"]), None)
+        if hit is None:
+            hit = min(segments, key=lambda s: s["start"] - mid if mid < s["start"]
+                      else mid - s["end"])
+        w["speaker"] = hit["speaker"]
+
+
+def fmt_ts(t):
+    t = max(0, int(t))
+    h, m, s = t // 3600, (t % 3600) // 60, t % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def render_transcript_txt(words, source, lang):
+    """Testo leggibile: un blocco per turno di parola, timecode a inizio turno
+    e marker intermedi ogni ~30 s (servono a trovare i punti da clippare)."""
+    order = []                      # speaker in ordine di prima apparizione
+    for w in words:
+        sp = w.get("speaker")
+        if sp is not None and sp not in order:
+            order.append(sp)
+    label = {sp: f"SPEAKER {i + 1}" for i, sp in enumerate(order)}
+
+    turns = []
+    for w in words:
+        sp = w.get("speaker")
+        if not turns or turns[-1]["speaker"] != sp:
+            turns.append({"speaker": sp, "start": w["start"], "words": []})
+        turns[-1]["words"].append(w)
+
+    lines = [f"# Transcript: {source}",
+             f"# Lingua: {lang} — speaker: {len(order) or 'non riconosciuti'}",
+             ""]
+    for t in turns:
+        head = f"[{fmt_ts(t['start'])}]"
+        if t["speaker"] is not None:
+            head += f" {label[t['speaker']]}:"
+        lines.append(head)
+        buf, last_mark = [], t["start"]
+        for w in t["words"]:
+            if (w["start"] - last_mark >= 30 and buf
+                    and buf[-1].endswith((".", "?", "!"))):
+                buf.append(f"[{fmt_ts(w['start'])}]")
+                last_mark = w["start"]
+            buf.append(w["text"])
+        lines.append(" ".join(buf))
+        lines.append("")
+    return "\n".join(lines), len(order)
+
+
+def run_transcription(job_id):
+    with t_slots:
+        job = tjobs[job_id]
+        video = job["path"]
+        wav = os.path.join(tempfile.gettempdir(), f"sv-{job_id}.wav")
+        out_base = os.path.join(tempfile.gettempdir(), f"sv-out-{job_id}")
+        try:
+            tset(job, status="estraggo l'audio", progress=0.0)
+            extract_audio(video, wav)
+
+            model = ensure_whisper_model(job)
+            lang = config.get("tlang", "auto")
+            tset(job, status="trascrivo", progress=0.0)
+            run_whisper(wav, model, lang, out_base, job)
+            with open(out_base + ".json") as f:
+                full = json.load(f)
+            words = tokens_to_words(full)
+            if not words:
+                raise RuntimeError("nessun parlato riconosciuto nel file")
+            lang_out = (full.get("result") or {}).get("language") or lang
+
+            diar_error = None
+            try:
+                ensure_python_deps(job)
+                ensure_diar_models(job)
+                tset(job, status="riconosco gli speaker — sui video lunghi "
+                                 "servono alcuni minuti", progress=None)
+                spk = config.get("tspeakers", "auto")
+                n = int(spk) if spk != "auto" else -1
+                assign_speakers(words, diarize_wav(
+                    wav, n, on_progress=lambda p: tset(job, progress=p)))
+            except Exception as e:            # senza speaker il transcript resta utile
+                diar_error = str(e)
+
+            txt, n_speakers = render_transcript_txt(
+                words, os.path.basename(video), lang_out)
+            stem = os.path.splitext(video)[0]
+            with open(stem + ".transcript.txt", "w") as f:
+                f.write(txt)
+            with open(stem + ".transcript.json", "w") as f:
+                json.dump({"text": " ".join(w["text"] for w in words),
+                           "words": words, "language": lang_out,
+                           "source": os.path.basename(video)}, f)
+
+            note = f"{n_speakers} speaker" if n_speakers else None
+            if diar_error:
+                note = f"senza speaker ({diar_error[:120]})"
+            with lock:
+                extra_open.add(stem + ".transcript.txt")
+            tset(job, status="fatto", progress=100.0,
+                 txt=stem + ".transcript.txt", note=note)
+        except Exception as e:
+            tset(job, status="errore", error=str(e))
+        finally:
+            for p in (wav, out_base + ".json"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+# File fuori dalla cartella download che l'app stessa ha prodotto (transcript
+# di video locali): /api/open può aprirli anche se non stanno in DEST.
+extra_open = set()
+
+pick_lock = threading.Lock()
+
+
+def choose_local_file():
+    """File picker nativo per scegliere un video/audio ovunque sul Mac.
+    Con pywebview usa il dialog agganciato alla finestra; in modalità
+    browser (server headless) ripiega su AppleScript."""
+    try:
+        import webview
+        if webview.windows:
+            r = webview.windows[0].create_file_dialog(
+                webview.OPEN_DIALOG,
+                file_types=("Video e audio (*.mp4;*.m4a;*.webm;*.mkv;*.mp3;*.mov)",))
+            return r[0] if r else None
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             'POSIX path of (choose file with prompt '
+             '"Scegli il video o l\'audio da trascrivere")'],
+            capture_output=True, text=True)
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    except OSError:
+        return None
+
+
+def add_transcription(path, anywhere=False):
+    """anywhere=True solo quando il path arriva dal file picker nativo
+    (scelto dall'utente), mai da un path arbitrario mandato dalla pagina."""
+    real = os.path.realpath(path)
+    base = os.path.realpath(DEST)
+    if not os.path.exists(real):
+        return None, "file non trovato"
+    if not anywhere and not real.startswith(base + os.sep):
+        return None, "file non trovato"
+    if not real.lower().endswith(TRANSCRIBE_EXTS):
+        return None, "formato non trascrivibile"
+    if FFMPEG == "ffmpeg" and not shutil.which("ffmpeg"):
+        return None, "manca ffmpeg — installa con: brew install ffmpeg"
+    if WHISPER == "whisper-cli" and not shutil.which("whisper-cli"):
+        return None, "manca whisper — installa con: brew install whisper-cpp"
+    with lock:
+        active = any(t["path"] == real and t["status"] not in ("fatto", "errore")
+                     for t in tjobs.values())
+    if active:
+        return None, "trascrizione già in corso per questo file"
+    job_id = uuid.uuid4().hex[:8]
+    with lock:
+        tjobs[job_id] = {"id": job_id, "path": real,
+                         "file": os.path.basename(real), "status": "in coda",
+                         "progress": 0.0, "txt": None, "note": None, "error": None}
+        tjobs_order.insert(0, job_id)
+    threading.Thread(target=run_transcription, args=(job_id,), daemon=True).start()
+    return job_id, None
+
+
 # ---------------------------------------------------------------- download
 def build_format_args(quality):
     if quality == "audio":
@@ -248,12 +669,42 @@ def run_gallery_dl(job, browser):
         return 1, files
 
 
+# Errori di rete transitori (DNS che non risolve, timeout, reset): non è
+# colpa del video, si riprova da soli invece di segnare subito "errore"
+NET_ERRORS = ("failed to resolve", "nodename nor servname",
+              "temporary failure", "timed out", "timeout",
+              "connection reset", "network is unreachable",
+              "getaddrinfo failed", "connection refused",
+              "errno 8", "unable to connect")
+# Errori che di solito si risolvono col login: si riprova coi cookie di Chrome
+LOGIN_ERRORS = ("login", "logged-in", "logged in", "cookies",
+                "authentication", "rate-limit", "not available")
+
+ERRLOG = os.path.join(SUPPORT, "errors.log")
+
+
+def log_error(url, browser, tail):
+    """Diario degli errori di download (ultime righe di output yt-dlp):
+    quando "si blocca di nuovo" qui c'è la prova di cosa è successo davvero."""
+    try:
+        if os.path.exists(ERRLOG) and os.path.getsize(ERRLOG) > 512 * 1024:
+            os.replace(ERRLOG, ERRLOG + ".old")
+        with open(ERRLOG, "a") as f:
+            f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"browser={browser} {url}\n")
+            f.write("\n".join(tail) + "\n")
+    except OSError:
+        pass
+
+
 def run_job(job_id):
     with slots:
         with lock:
             job = jobs[job_id]
             job["status"] = "in corso"
         browser = job.get("browser", "none")
+        net_retries = 0
+        login_retries = 0
         # Il minutaggio entra nel nome file: tagli diversi dello stesso video
         # non collidono col file intero (yt-dlp salterebbe il download)
         outtmpl = "%(title).80s [%(id)s]"
@@ -272,10 +723,10 @@ def run_job(job_id):
             args += build_format_args(job["quality"])
             args.append(job["url"])
 
+            tail = []
             try:
                 proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True)
-                tail = []
                 for line in proc.stdout:
                     line = line.rstrip()
                     if line:
@@ -318,6 +769,17 @@ def run_job(job_id):
                 error = str(e)
 
             low = error.lower()
+            log_error(job["url"], browser, tail or [error])
+
+            # Rete assente o instabile: aspetta e riprova (fino a 3 volte)
+            if any(s in low for s in NET_ERRORS) and net_retries < 3:
+                net_retries += 1
+                with lock:
+                    job["status"] = f"problema di rete — riprovo ({net_retries}/3)"
+                    job["progress"] = 0.0
+                time.sleep(4 * net_retries)
+                continue
+
             # Post fotografici / caroselli: yt-dlp non trova video -> gallery-dl
             if "no video formats found" in low or "there is no video" in low:
                 with lock:
@@ -335,14 +797,50 @@ def run_job(job_id):
                 finish_job(job)
                 return
 
-            # TikTok & co.: se serve il login, riprova coi cookie di Chrome
-            if browser == "none" and "login" in low:
+            # TikTok, Instagram & co.: se l'errore parla di login/cookie,
+            # riprova coi cookie di Chrome
+            if browser == "none" and any(s in low for s in LOGIN_ERRORS):
                 browser = "chrome"
                 with lock:
                     job["browser"] = browser
                     job["status"] = "riprovo con login"
                 continue
 
+            # Il muro "requiring login" di TikTok è servito a campione, anche
+            # con cookie validi (verificato: stessa URL, stessi cookie, a volte
+            # passa e a volte no). Riprovare distanziati di solito sblocca.
+            if "login" in low and login_retries < 3:
+                login_retries += 1
+                wait = (20, 45, 90)[login_retries - 1]
+                with lock:
+                    job["status"] = (f"il sito blocca a campione — riprovo "
+                                     f"tra {wait}s ({login_retries}/3)")
+                    job["progress"] = 0.0
+                time.sleep(wait)
+                continue
+
+            # Muro ancora su dopo i retry ravvicinati: il blocco di TikTok
+            # dura minuti. Libera lo slot e riprova da solo tra 5/10 minuti,
+            # senza tenere occupata la coda.
+            late = job.get("late_retries", 0)
+            if "login" in low and late < 2:
+                mins = 5 * (late + 1)
+                with lock:
+                    job["late_retries"] = late + 1
+                    job["status"] = (f"sito bloccato — nuovo tentativo "
+                                     f"automatico tra {mins} min")
+                    job["progress"] = 0.0
+                t = threading.Timer(mins * 60, run_job, args=(job_id,))
+                t.daemon = True
+                t.start()
+                return
+
+            if any(s in low for s in NET_ERRORS):
+                error = "problema di rete (controlla la connessione) — " + error
+            elif "login" in low and login_retries:
+                error = ("il sito ha rifiutato tutti i tentativi (blocco a "
+                         "campione) — aspetta qualche minuto e premi "
+                         "Ri-scarica · " + error)
             with lock:
                 job["status"] = "errore"
                 job["error"] = error
@@ -414,12 +912,11 @@ class Handler(BaseHTTPRequestHandler):
             # bloccare i thread di download
             with lock:
                 data = {"done": done_count,
-                        "jobs": [dict(jobs[j]) for j in jobs_order]}
+                        "jobs": [dict(jobs[j]) for j in jobs_order],
+                        "tjobs": [dict(tjobs[j]) for j in tjobs_order]}
             self._send(data)
         elif self.path == "/api/history":
             self._send(load_history())
-        elif self.path == "/api/files":
-            self._send(list_files())
         elif self.path == "/api/settings":
             self._send(config)
         else:
@@ -442,7 +939,9 @@ class Handler(BaseHTTPRequestHandler):
             # realpath: niente "../" per uscire dalla cartella dei download
             path = os.path.realpath(d.get("path", ""))
             base = os.path.realpath(DEST)
-            if path.startswith(base + os.sep) and os.path.exists(path):
+            with lock:
+                allowed = path.startswith(base + os.sep) or path in extra_open
+            if allowed and os.path.exists(path):
                 reveal = d.get("reveal")
                 subprocess.Popen(["open", "-R", path] if reveal else ["open", path])
                 self._send({"ok": True})
@@ -452,6 +951,32 @@ class Handler(BaseHTTPRequestHandler):
             os.makedirs(DEST, exist_ok=True)
             subprocess.Popen(["open", DEST])
             self._send({"ok": True})
+        elif self.path == "/api/transcribe":
+            d = self._body()
+            job_id, err = add_transcription(str(d.get("path", "")))
+            if err:
+                self._send({"ok": False, "error": err}, code=400)
+            else:
+                self._send({"ok": True, "id": job_id})
+        elif self.path == "/api/transcribe_pick":
+            # Il path esce dal file picker nativo, non dalla pagina: può
+            # essere ovunque sul Mac. Un dialog alla volta.
+            if not pick_lock.acquire(blocking=False):
+                self._send({"ok": False, "error": "selettore file già aperto"},
+                           code=409)
+                return
+            try:
+                path = choose_local_file()
+            finally:
+                pick_lock.release()
+            if not path:
+                self._send({"ok": True, "canceled": True})
+                return
+            job_id, err = add_transcription(path, anywhere=True)
+            if err:
+                self._send({"ok": False, "error": err}, code=400)
+            else:
+                self._send({"ok": True, "id": job_id})
         elif self.path == "/api/preview":
             d = self._body()
             u = str(d.get("url", "")).strip()
@@ -475,6 +1000,10 @@ class Handler(BaseHTTPRequestHandler):
                 config["quality"] = d["quality"]
             if d.get("browser") in {"none", "chrome", "safari", "firefox"}:
                 config["browser"] = d["browser"]
+            if d.get("tlang") in {"auto", "it", "en"}:
+                config["tlang"] = d["tlang"]
+            if d.get("tspeakers") in {"auto", "2", "3", "4"}:
+                config["tspeakers"] = d["tspeakers"]
             try:
                 config["concurrent"] = min(6, max(1, int(d.get("concurrent",
                                            config["concurrent"]))))
@@ -508,7 +1037,7 @@ HTML = r"""<!doctype html>
   * { box-sizing:border-box; margin:0 }
   body { font:15px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;
     background:var(--bg); color:var(--text); }
-  .wrap { max-width:720px; margin:0 auto; padding:26px 20px 250px }
+  .wrap { max-width:720px; margin:0 auto; padding:26px 20px 40px }
   header { display:flex; align-items:center; gap:12px; margin-bottom:18px }
   .logo { width:38px; height:38px; border-radius:10px;
     background:linear-gradient(160deg,var(--accent2),var(--accent));
@@ -570,19 +1099,6 @@ HTML = r"""<!doctype html>
     justify-content:center; color:#fff; font-size:13px; text-align:center;
     padding:0 20px; background:rgba(0,0,0,.6) }
   .pvbar { display:flex; gap:9px; align-items:center; margin-top:9px; flex-wrap:wrap }
-  .fm { position:fixed; left:0; right:0; bottom:0; z-index:40; background:var(--card);
-    border-top:1px solid var(--line) }
-  .fmhead { display:flex; align-items:center; gap:9px; padding:9px 20px; cursor:pointer;
-    font-size:13px; font-weight:600; max-width:720px; margin:0 auto }
-  .fmbody { max-height:172px; overflow-y:auto; padding:0 20px 12px;
-    max-width:720px; margin:0 auto }
-  .fm.closed .fmbody { display:none }
-  .frow { display:flex; align-items:center; gap:10px; background:var(--bg);
-    border:1px solid var(--line); border-radius:10px; padding:8px 11px; margin-bottom:6px }
-  .fname { flex:1; min-width:0; font-size:13px; font-weight:600; color:var(--text);
-    text-decoration:none; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-    cursor:grab }
-  .fmeta { font-size:11px; color:var(--muted); white-space:nowrap }
   .overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.45);
     z-index:50; align-items:center; justify-content:center }
   .overlay.on { display:flex }
@@ -602,13 +1118,14 @@ HTML = r"""<!doctype html>
   <div class="logo"><svg viewBox="0 0 24 24"><path d="M12 3v10.2l3.6-3.6L17 11l-5 5-5-5 1.4-1.4L12 13.2V3h0zM5 19h14v2H5z"/></svg></div>
   <div><h1>Scarica Video</h1><div class="sub">YouTube · TikTok · Instagram e centinaia di siti</div></div>
   <div class="spacer"></div>
+  <button class="ghost" onclick="transcribeLocal()">Trascrivi file…</button>
   <button class="ghost" onclick="openFolder()">Apri cartella</button>
   <button class="ghost" onclick="openSettings()">Impostazioni</button>
   <button class="ghost" onclick="quitApp()">Esci</button>
 </header>
 
 <div class="panel">
-  <textarea id="urls" oninput="checkPreview()" placeholder="Incolla uno o più link (uno per riga)&#10;https://www.youtube.com/watch?v=…&#10;https://www.tiktok.com/@utente/video/…"></textarea>
+  <textarea id="urls" oninput="checkPreview()" onpaste="setTimeout(normalizeUrls,0)" placeholder="Incolla uno o più link (uno per riga)&#10;https://www.youtube.com/watch?v=…&#10;https://www.tiktok.com/@utente/video/…"></textarea>
   <div class="controls">
     <select id="quality" class="grow">
       <option value="1080" selected>1080p — H.264 (per DaVinci)</option>
@@ -647,17 +1164,8 @@ HTML = r"""<!doctype html>
 </div>
 
 <div id="activeWrap" style="display:none"><h2>In download</h2><div id="active"></div></div>
+<div id="twrap" style="display:none"><h2>Trascrizioni</h2><div id="tjobs"></div></div>
 <h2>Cronologia</h2><div id="history"><div class="empty">Ancora niente.</div></div>
-
-<div class="fm" id="fm">
-  <div class="fmhead" onclick="toggleFm()">
-    <span>📁</span><span id="fmTitle">Cartella download</span>
-    <span class="dot" id="fmCount"></span>
-    <span class="spacer"></span>
-    <button class="ghost" onclick="event.stopPropagation();loadFiles()">Aggiorna</button>
-  </div>
-  <div class="fmbody" id="files"></div>
-</div>
 
 <div class="overlay" id="ovl" onclick="if(event.target===this)closeSettings()">
   <div class="sheet">
@@ -682,6 +1190,21 @@ HTML = r"""<!doctype html>
       <div class="field"><label>Download simultanei (1–6)</label><input id="sConc" type="number" min="1" max="6"></div>
       <div class="field"><label>Connessioni per video (1–8)</label><input id="sFrag" type="number" min="1" max="8"></div>
     </div>
+    <div class="cols">
+      <div class="field"><label>Trascrizione: lingua</label>
+        <select id="sLang">
+          <option value="auto">Rileva da sola</option>
+          <option value="it">Italiano</option>
+          <option value="en">Inglese</option>
+        </select></div>
+      <div class="field"><label>Trascrizione: speaker</label>
+        <select id="sSpk">
+          <option value="auto">Rileva da sola</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select></div>
+    </div>
     <div class="sheetacts">
       <button class="ghost" onclick="closeSettings()">Annulla</button>
       <button class="go" onclick="saveSettings()">Salva</button>
@@ -704,6 +1227,7 @@ function cls(s){ return s==='fatto'?'fatto':s==='errore'?'errore':'attivo'; }
 
 // ------------------------------------------------------ azioni principali
 async function add(){
+  normalizeUrls();
   const urls = $('#urls').value.split('\n').filter(u=>u.trim());
   if(!urls.length) return;
   const body = { urls, quality:$('#quality').value, browser:$('#browser').value };
@@ -715,7 +1239,7 @@ async function add(){
 }
 function openFolder(){ api('/api/open_folder',{}); }
 function openFile(p,reveal){ api('/api/open',{path:p,reveal}); }
-function redownload(url){ $('#urls').value = url; checkPreview(); window.scrollTo({top:0,behavior:'smooth'}); $('#urls').focus(); }
+function redownload(url){ $('#urls').value = url; checkPreview(); normalizeUrls(); window.scrollTo({top:0,behavior:'smooth'}); $('#urls').focus(); }
 async function quitApp(){ await api('/api/quit',{}); document.body.innerHTML='<div class="wrap"><p class="empty">Chiuso. Puoi chiudere questa finestra.</p></div>'; }
 
 // ------------------------------------------------- preview YouTube: IN/OUT
@@ -723,8 +1247,41 @@ async function quitApp(){ await api('/api/quit',{}); document.body.innerHTML='<d
 // yt-dlp risolve l'URL diretto dello stream e lo riproduce un <video> nativo
 let pvId = null, pvReq = 0;
 function ytIdOf(u){
-  const m = (u||'').match(/(?:youtube\.com\/(?:watch\?[^\s]*v=|shorts\/|live\/|embed\/)|youtu\.be\/)([\w-]{11})/);
+  const m = (u||'').match(/(?:youtube(?:-nocookie)?\.com\/(?:watch\?[^\s]*v=|shorts\/|live\/|embed\/|v\/)|youtu\.be\/)([\w-]{11})/);
   return m ? m[1] : null;
+}
+// Qualunque formato di link YouTube (watch, youtu.be, Shorts, live, embed,
+// music/m., con playlist o secondaggio) -> URL canonico. Il ?t= diventa il
+// punto di partenza nel campo DA, usato solo se attivi "Solo un intervallo".
+function parseYt(u){
+  const id = ytIdOf(u);
+  if(!id) return null;
+  let secs = 0;
+  const t = (u.match(/[?&#](?:t|start)=(\d+(?:[hms]\d*)*s?)/i)||[])[1];
+  if(t){
+    if(/^\d+s?$/i.test(t)) secs = parseInt(t,10);
+    else{
+      const p = t.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$/i);
+      if(p) secs = (+p[1]||0)*3600 + (+p[2]||0)*60 + (+p[3]||0);
+    }
+  }
+  return { url:'https://www.youtube.com/watch?v='+id, start:secs };
+}
+function normalizeUrls(){
+  const box = $('#urls');
+  let changed = false;
+  const out = box.value.split('\n').map(line=>{
+    const y = parseYt(line.trim());
+    if(!y) return line;
+    if(y.start > 0 && !$('#start').value.trim()){
+      $('#start').value = fmtT(y.start);
+      $('#inV').textContent = fmtT(y.start);
+    }
+    if(y.url === line.trim()) return line;
+    changed = true;
+    return y.url;
+  });
+  if(changed){ box.value = out.join('\n'); checkPreview(); }
 }
 function pvMsg(t){ const m = $('#pvMsg'); m.textContent = t; m.style.display = t ? 'flex' : 'none'; }
 function checkPreview(){
@@ -741,7 +1298,15 @@ function checkPreview(){
   const my = ++pvReq;
   api('/api/preview', {url: first}).then(r=>{
     if(my !== pvReq) return;               // nel frattempo l'URL è cambiato
-    if(r.ok && r.src){ v.src = r.src; pvMsg(''); }
+    if(r.ok && r.src){
+      v.src = r.src; pvMsg('');
+      // Link incollato con secondaggio: la preview parte dal punto giusto
+      const st = $('#start').value.trim();
+      if(/^\d+(:\d+){0,2}$/.test(st)){
+        const s = st.split(':').reduce((a,x)=>a*60 + +x, 0);
+        if(s) v.addEventListener('loadedmetadata', ()=>{ v.currentTime = s; }, {once:true});
+      }
+    }
     else pvMsg('Preview non disponibile per questo video — imposta DA e A a mano');
   }).catch(()=>{ if(my === pvReq) pvMsg('Preview non disponibile — imposta DA e A a mano'); });
 }
@@ -761,42 +1326,32 @@ document.addEventListener('keydown', e=>{
   if(e.key==='o'||e.key==='O'){ e.preventDefault(); setOut(); }
 });
 
-// ------------------------------------------------------ cartella download
-function fmtSize(b){ return b>=1e9 ? (b/1e9).toFixed(2)+' GB' : b>=1e6 ? (b/1e6).toFixed(1)+' MB' : Math.max(1,Math.round(b/1e3))+' KB'; }
-function fmtDate(t){ const d = new Date(t*1000);
-  return d.toLocaleDateString('it-IT',{day:'numeric',month:'short'})+' '+d.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'}); }
-async function loadFiles(){
-  const fs = await api('/api/files');
-  $('#fmCount').textContent = fs.length ? fs.length+' file · trascinali in DaVinci' : '';
-  $('#files').innerHTML = fs.length ? fs.map(f=>`
-    <div class="frow">
-      <a class="fname" draggable="true" href="file://${esc(encodeURI(f.path))}"
-         ondragstart='dragFile(event,${attr(f.path)})' onclick="return false"
-         ondblclick='openFile(${attr(f.path)},false)' title="${esc(f.name)} — doppio click per aprire">${esc(f.name)}</a>
-      <span class="fmeta">${fmtSize(f.size)} · ${fmtDate(f.mtime)}</span>
-      <button class="chip" onclick='openFile(${attr(f.path)},true)'>Finder</button>
-    </div>`).join('') : '<div class="empty">Cartella vuota.</div>';
+// ------------------------------------------------------ trascrizione
+function canTranscribe(name){ return /\.(mp4|m4a|webm|mkv|mp3|mov)$/i.test(name||''); }
+async function transcribe(p){
+  const r = await api('/api/transcribe', {path:p});
+  if(!r.ok) alert(r.error||'Impossibile trascrivere');
+  refresh();
 }
-function dragFile(e,p){
-  if(window.pywebview && window.pywebview.api && window.pywebview.api.start_drag){
-    // App nativa: annulla il drag HTML5 (DaVinci non lo accetta) e avvia
-    // un drag macOS vero via NSDraggingSession
-    e.preventDefault();
-    window.pywebview.api.start_drag(p);
-    return;
-  }
-  const u = 'file://'+encodeURI(p);
-  e.dataTransfer.setData('text/uri-list', u);
-  e.dataTransfer.setData('text/plain', p);
-  e.dataTransfer.effectAllowed = 'copy';
+// Trascrizione di un file qualunque sul Mac: il server apre il file picker
+// nativo e mette in coda il file scelto
+let picking = false;
+async function transcribeLocal(){
+  if(picking) return;
+  picking = true;
+  try{
+    const r = await api('/api/transcribe_pick', {});
+    if(!r.ok) alert(r.error||'Impossibile trascrivere');
+  }catch(e){ alert('Impossibile aprire il selettore file'); }
+  picking = false;
+  refresh();
 }
-function toggleFm(){ $('#fm').classList.toggle('closed'); }
-
 // ----------------------------------------------------------- impostazioni
 function openSettings(){
   api('/api/settings').then(s=>{
     $('#sDest').value = s.dest; $('#sQuality').value = s.quality; $('#sBrowser').value = s.browser;
     $('#sConc').value = s.concurrent; $('#sFrag').value = s.fragments;
+    $('#sLang').value = s.tlang||'auto'; $('#sSpk').value = s.tspeakers||'auto';
     $('#ovl').classList.add('on');
   });
 }
@@ -804,13 +1359,13 @@ function closeSettings(){ $('#ovl').classList.remove('on'); }
 async function saveSettings(){
   const r = await api('/api/settings', { dest:$('#sDest').value.trim(),
     quality:$('#sQuality').value, browser:$('#sBrowser').value,
-    concurrent:$('#sConc').value, fragments:$('#sFrag').value });
+    concurrent:$('#sConc').value, fragments:$('#sFrag').value,
+    tlang:$('#sLang').value, tspeakers:$('#sSpk').value });
   if(!r.ok){ alert(r.error||'Impossibile salvare'); return; }
-  applyDefaults(r); closeSettings(); loadFiles();
+  applyDefaults(r); closeSettings();
 }
 function applyDefaults(s){
   $('#quality').value = s.quality; $('#browser').value = s.browser;
-  $('#fmTitle').textContent = s.dest.replace(/^\/Users\/[^/]+/, '~');
 }
 
 // ----------------------------------------------------------------- polling
@@ -821,6 +1376,7 @@ async function loadHistory(){
   $('#history').innerHTML = hist.length ? hist.map(h=>{
     const ok = h.status==='fatto';
     const open = ok && h.filepath ? `<button class="chip" onclick='openFile(${attr(h.filepath)},false)'>Apri</button>
+        ${canTranscribe(h.filepath)?`<button class="chip" onclick='transcribe(${attr(h.filepath)})'>Trascrivi</button>`:''}
         <button class="chip" onclick='openFile(${attr(h.filepath)},true)'>Finder</button>` : '';
     return `<div class="hrow ${cls(h.status)}">
       <div class="info">
@@ -848,120 +1404,38 @@ async function refresh(){
       <div class="track"><div class="fill" style="width:${j.progress}%"></div></div></div>`;
   }).join('');
 
+  const tj = r.tjobs||[];
+  const tActive = tj.some(t=>t.status!=='fatto'&&t.status!=='errore');
+  $('#twrap').style.display = tj.length ? 'block':'none';
+  $('#tjobs').innerHTML = tj.map(t=>{
+    const done = t.status==='fatto', err = t.status==='errore';
+    const pct = t.progress==null ? 100 : t.progress;
+    const elapsed = t.since ? ' · da '+fmtT(Date.now()/1000 - t.since) : '';
+    const line = done ? (t.note||'transcript pronto')
+      : err ? esc(t.error||'errore')
+      : `${esc(t.status)}${t.progress!=null&&t.progress>0?(' · '+t.progress.toFixed(0)+'%'):''}${elapsed}`;
+    const acts = done&&t.txt ? `<div class="acts" style="margin-top:8px">
+        <button class="chip" onclick='openFile(${attr(t.txt)},false)'>Apri transcript</button>
+        <button class="chip" onclick='openFile(${attr(t.txt)},true)'>Finder</button></div>` : '';
+    return `<div class="job ${cls(t.status)}">
+      <span class="badge">${esc(t.status.toUpperCase())}</span>
+      <div class="name">${esc(t.file)}</div>
+      <div class="meta">${line}</div>
+      <div class="track"><div class="fill" style="width:${pct}%"></div></div>${acts}</div>`;
+  }).join('');
+
   // Cronologia e cartella cambiano solo quando un job finisce
   if(r.done !== lastDone){
     lastDone = r.done;
-    loadHistory(); loadFiles();
+    loadHistory();
   }
 
-  clearTimeout(window._t); window._t = setTimeout(refresh, active.length?800:4000);
+  clearTimeout(window._t);
+  window._t = setTimeout(refresh, (active.length||tActive)?800:4000);
 }
 api('/api/settings').then(applyDefaults);
 refresh();
-// Segnala al backend quando il ponte pywebview è pronto (diagnostica +
-// installa il monitor eventi per il drag nativo)
-(function waitBridge(n){
-  if(window.pywebview && window.pywebview.api && window.pywebview.api.ping){
-    window.pywebview.api.ping();
-  } else if(n < 20){ setTimeout(()=>waitBridge(n+1), 500); }
-})(0);
 </script></div></body></html>"""
-
-
-def make_js_api():
-    """API esposta alla pagina da pywebview. start_drag avvia un drag nativo
-    macOS (NSDraggingSession) col file vero: il drag HTML5 di WKWebView non
-    viene riconosciuto da app come DaVinci, questo sì. Un event monitor
-    locale conserva l'ultimo evento mouse reale: la chiamata dal JS arriva
-    in modo asincrono e NSApp.currentEvent() a quel punto non è affidabile."""
-    from AppKit import (NSApp, NSDraggingItem, NSDragOperationCopy, NSEvent,
-                        NSEventMaskLeftMouseDown, NSEventMaskLeftMouseDragged,
-                        NSEventTypeLeftMouseDown, NSEventTypeLeftMouseDragged,
-                        NSObject, NSURL, NSWorkspace)
-    from PyObjCTools import AppHelper
-
-    log_path = os.path.join(SUPPORT, "drag.log")
-
-    def dlog(msg):
-        try:
-            with open(log_path, "a") as f:
-                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
-        except OSError:
-            pass
-
-    class _DragSource(NSObject):
-        def draggingSession_sourceOperationMaskForDraggingContext_(self, s, c):
-            return NSDragOperationCopy
-
-    source = _DragSource.alloc().init()
-    state = {"event": None, "monitor": None}
-
-    def install_monitor():
-        if state["monitor"] is not None:
-            return
-        def keep(event):
-            state["event"] = event
-            return event
-        mask = NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged
-        state["monitor"] = \
-            NSEvent.addLocalMonitorForEventsMatchingMask_handler_(mask, keep)
-        dlog("monitor eventi installato")
-
-    class Api:
-        def install(self):
-            AppHelper.callAfter(install_monitor)
-
-        def ping(self):
-            dlog("bridge js ok")
-            AppHelper.callAfter(install_monitor)
-            return True
-
-        def start_drag(self, path):
-            real = os.path.realpath(str(path))
-            base = os.path.realpath(DEST)
-            if not real.startswith(base + os.sep) or not os.path.exists(real):
-                dlog(f"start_drag rifiutato: {path}")
-                return False
-            dlog(f"start_drag: {os.path.basename(real)}")
-            attempts = {"n": 0}
-
-            def begin():
-                attempts["n"] += 1
-                install_monitor()
-                event = state["event"]
-                cur = NSApp.currentEvent()
-                if event is None and cur is not None and cur.type() in (
-                        NSEventTypeLeftMouseDown, NSEventTypeLeftMouseDragged):
-                    event = cur
-                if event is None or event.window() is None:
-                    dlog(f"tentativo {attempts['n']}: nessun evento mouse "
-                         f"(currentEvent={cur.type() if cur else None})")
-                    if attempts["n"] < 12:   # il drag è in corso: riprova
-                        AppHelper.callLater(0.04, begin)
-                    return
-                try:
-                    from webview.platforms.cocoa import BrowserView
-                    views = list(BrowserView.instances.values())
-                    if not views:
-                        dlog("nessuna BrowserView")
-                        return
-                    wk = views[0].webkit
-                    url = NSURL.fileURLWithPath_(real)
-                    item = NSDraggingItem.alloc().initWithPasteboardWriter_(url)
-                    icon = NSWorkspace.sharedWorkspace().iconForFile_(real)
-                    pt = wk.convertPoint_fromView_(event.locationInWindow(), None)
-                    item.setDraggingFrame_contents_(
-                        ((pt.x - 16, pt.y - 16), (32, 32)), icon)
-                    wk.beginDraggingSessionWithItems_event_source_(
-                        [item], event, source)
-                    dlog("sessione di drag avviata")
-                except Exception as e:
-                    dlog(f"errore beginDraggingSession: {e}")
-
-            AppHelper.callAfter(begin)
-            return True
-
-    return Api()
 
 
 def set_mac_identity():
@@ -981,6 +1455,32 @@ def set_mac_identity():
         pass
 
 
+def update_ytdlp_daily():
+    """yt-dlp smette di funzionare quando i siti cambiano qualcosa: tenerlo
+    aggiornato è la prima difesa. Al massimo una volta al giorno, in
+    background, in silenzio; se fallisce (offline) riproverà al prossimo avvio."""
+    py = os.path.join(SUPPORT, "venv", "bin", "python3")
+    stamp = os.path.join(SUPPORT, "ytdlp-update.stamp")
+    if not os.path.exists(py):
+        return
+    try:
+        if time.time() - os.path.getmtime(stamp) < 86400:
+            return
+    except OSError:
+        pass
+
+    def worker():
+        r = subprocess.run([py, "-m", "pip", "install", "--quiet",
+                            "--disable-pip-version-check", "--upgrade",
+                            "yt-dlp[default,curl-cffi]", "gallery-dl"],
+                           capture_output=True)
+        if r.returncode == 0:
+            with open(stamp, "w") as f:
+                f.write(str(time.time()))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def start_server():
     global server
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
@@ -991,6 +1491,7 @@ if __name__ == "__main__":
     init_db()
     load_config()
     os.makedirs(DEST, exist_ok=True)
+    update_ytdlp_daily()
     url = f"http://127.0.0.1:{PORT}/"
     # Avvia il server; se la porta è occupata un'istanza è già attiva -> apri solo la finestra
     try:
@@ -1000,12 +1501,8 @@ if __name__ == "__main__":
     try:
         import webview
         set_mac_identity()
-        try:
-            api = make_js_api()
-        except Exception:
-            api = None           # niente drag nativo, resta il fallback HTML5
         webview.create_window("Scarica Video", url, width=780, height=920,
-                              min_size=(560, 640), js_api=api)
+                              min_size=(560, 640))
         webview.start()          # blocca finché la finestra resta aperta; chiusura = uscita
     except ImportError:
         # Nessun pywebview (uso da riga di comando): resta come server headless

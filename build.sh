@@ -25,6 +25,13 @@ mkdir -p "$SUPPORT"
 [ -x "$VENV/bin/python3" ] || "$PYBREW" -m venv "$VENV"
 "$VENV/bin/python3" -m pip install --quiet --disable-pip-version-check --upgrade pip >/dev/null
 "$VENV/bin/python3" -m pip install --quiet --disable-pip-version-check pywebview >/dev/null
+# Trascrizione con speaker: sherpa-onnx + numpy (se fallisce, l'app li
+# installa comunque da sola al primo uso)
+"$VENV/bin/python3" -m pip install --quiet --disable-pip-version-check sherpa-onnx numpy >/dev/null || true
+# yt-dlp con impersonificazione browser (curl_cffi: serve a TikTok & co.)
+# e gallery-dl nel venv: l'app li preferisce a quelli di Homebrew e li
+# auto-aggiorna una volta al giorno
+"$VENV/bin/python3" -m pip install --quiet --disable-pip-version-check -U "yt-dlp[default,curl-cffi]" gallery-dl >/dev/null || true
 
 echo "→ Assemblo il bundle .app…"
 rm -rf "$APP"

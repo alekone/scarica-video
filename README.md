@@ -9,8 +9,9 @@ Sotto il cofano usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp); il backend è 
 - 🎬 **Multi-URL** — incolla tanti link insieme, uno per riga
 - 🎯 **Preview YouTube con IN/OUT** — incolli un link YouTube e parte la preview (stream diretto risolto da yt-dlp, funziona anche coi video che bloccano l'embed): fermati sul punto giusto e premi <kbd>I</kbd> (inizio) e <kbd>O</kbd> (fine) come in DaVinci, i campi DA/A si riempiono da soli
 - ⏱️ **Intervallo DA → A** — scarica solo un pezzo del video, con taglio preciso ai keyframe (`--force-keyframes-at-cuts`); ogni taglio ha il minutaggio nel nome file, quindi tagli diversi dello stesso video convivono
-- 📁 **Mini file-manager** ancorato in basso: i file scaricati sono lì, pronti da trascinare direttamente nella media pool di DaVinci (drag nativo macOS, come dal Finder)
-- ⚙️ **Impostazioni** — cartella di destinazione, qualità e login predefiniti, download simultanei e connessioni per video (salvate in `config.json`)
+- 🔗 **Link YouTube normalizzati** — incolli un link in qualunque formato (watch, youtu.be, Shorts, live, embed, con playlist o parametri di condivisione) e diventa l'URL canonico; se il link ha un secondaggio (`?t=…`), finisce nel campo DA come punto di partenza opzionale per "Solo un intervallo"
+- 🎙️ **Trascrizione locale con speaker** — pulsante **Trascrivi** su ogni video: whisper.cpp (large-v3-turbo, Metal) trascrive con timestamp per parola e sherpa-onnx riconosce *chi parla quando* (2-3 speaker o rilevamento automatico). Tutto sul Mac, nessun upload, nessun account. Output accanto al video: `<nome>.transcript.txt` (leggibile, con speaker e timecode — perfetto da dare a Claude per trovare i punti da clippare) e `<nome>.transcript.json` (parole con start/end). Col pulsante **Trascrivi file…** in alto trascrivi anche un video/audio qualunque già sul Mac, non solo quelli scaricati
+- ⚙️ **Impostazioni** — cartella di destinazione, qualità e login predefiniti, download simultanei e connessioni per video, lingua e numero di speaker della trascrizione (salvate in `config.json`)
 - 📊 **Progress bar** con percentuale, velocità ed ETA in tempo reale; download a frammenti paralleli
 - ♻️ **File già presente?** Nessun doppione silenzioso: la cronologia segnala "file già presente — non riscaricato"
 - 🕑 **Cronologia** persistente (SQLite): apri file, mostra nel Finder, ri-scarica
@@ -26,7 +27,10 @@ I file finiscono in `~/Movies/Scarica Video`.
 ```bash
 brew install yt-dlp ffmpeg
 brew install gallery-dl   # opzionale, per foto/caroselli Instagram
+brew install whisper-cpp  # opzionale, per la trascrizione
 ```
+
+Per la trascrizione, al primo uso l'app scarica da sola i modelli (~1.7 GB, una volta sola) in `~/Library/Application Support/Scarica Video/models/` e installa `sherpa-onnx` nel proprio venv.
 
 macOS con Python 3 di sistema (`/usr/bin/python3`, già presente).
 

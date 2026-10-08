@@ -636,6 +636,49 @@ def add_transcription(path, anywhere=False):
 
 
 # ---------------------------------------------------------------- download
+FFPROBE = find_bin("ffprobe")
+
+
+def ensure_h264(job, path):
+    """Le qualità "per DaVinci" promettono H.264, ma alcuni siti offrono
+    certe risoluzioni solo in VP9/AV1 (QuickTime e DaVinci non li aprono).
+    Se il file scaricato non è H.264/HEVC lo converte sul posto."""
+    try:
+        r = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=codec_name",
+                            "-of", "csv=p=0", path],
+                           capture_output=True, text=True, timeout=60)
+        codec = (r.stdout or "").strip().strip(",").splitlines()[0] if r.stdout.strip() else ""
+    except (subprocess.TimeoutExpired, OSError, IndexError):
+        return
+    if codec in ("", "h264", "hevc"):
+        return
+    with lock:
+        job["status"] = f"converto in H.264 (era {codec})"
+    tmp = path + ".h264.mp4"
+    # prima l'encoder hardware (veloce); se fa i capricci, libx264
+    for enc in (("h264_videotoolbox", "-b:v", "8M"), ("libx264", "-crf", "18")):
+        try:
+            ok = subprocess.run(
+                [FFMPEG, "-y", "-loglevel", "error", "-i", path,
+                 "-c:v", enc[0], enc[1], enc[2],
+                 "-c:a", "copy", "-movflags", "+faststart", tmp],
+                capture_output=True, timeout=1800).returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            ok = False
+        if ok and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, path)
+            with lock:
+                job["note"] = f"convertito in H.264 (il sito offriva solo {codec})"
+            return
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    with lock:
+        job["note"] = f"⚠ codec {codec}: potrebbe non aprirsi (conversione fallita)"
+
+
 def build_format_args(quality):
     if quality == "audio":
         return ["-x", "--audio-format", "m4a"]
@@ -643,7 +686,10 @@ def build_format_args(quality):
         return ["-f", "bv*+ba/b", "--merge-output-format", "mp4"]
     if quality == "best":                      # massima H.264 (per DaVinci)
         return ["-S", "vcodec:h264,ext:mp4:m4a"]
-    return ["-S", f"res:{quality},vcodec:h264,ext:mp4:m4a"]  # 1080 / 720
+    # vcodec PRIMA di res: Instagram & co. hanno il 1080p solo in VP9 (che
+    # QuickTime/DaVinci non aprono) — meglio un H.264 a 720p che un file
+    # inutilizzabile; se resta solo VP9/AV1 ci pensa ensure_h264 a valle
+    return ["-S", f"vcodec:h264,res:{quality},ext:mp4:m4a"]  # 1080 / 720
 
 
 def run_gallery_dl(job, browser):
@@ -756,6 +802,12 @@ def run_job(job_id):
                             job["note"] = "file già presente — non riscaricato"
                 proc.wait()
                 if proc.returncode == 0:
+                    with lock:
+                        fp, q = job.get("filepath"), job["quality"]
+                    # "max" lascia VP9/AV1 di proposito; le altre qualità
+                    # video promettono un file che si apre ovunque
+                    if fp and q in ("1080", "720", "best") and os.path.exists(fp):
+                        ensure_h264(job, fp)
                     with lock:
                         job["status"] = "fatto"
                         job["progress"] = 100.0

@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 REPO = "alekone/scarica-video"   # per il controllo aggiornamenti (GitHub Releases)
 
 PORT = 8642
@@ -150,8 +150,11 @@ def parse_ver(s):
 
 
 def check_update():
-    if not os.path.isdir(os.environ.get("SV_APP", "")):
+    app_path = os.environ.get("SV_APP", "")
+    if not os.path.isdir(app_path):
         return                       # modalità sviluppo: niente auto-update
+    if "/AppTranslocation/" in app_path:
+        return                       # copia temporanea di macOS: impossibile aggiornarla
     try:
         req = urllib.request.Request(
             f"https://api.github.com/repos/{REPO}/releases/latest",
@@ -189,6 +192,9 @@ def do_update():
             raise ValueError("origine aggiornamento non riconosciuta")
         if not os.path.isdir(app_path):
             raise ValueError("app non trovata")
+        if "/AppTranslocation/" in app_path:
+            raise ValueError("sposta l'app nella cartella Applicazioni "
+                             "col Finder, riaprila e riprova")
         zip_path = os.path.join(SUPPORT, "update.zip")
         req = urllib.request.Request(
             url, headers={"User-Agent": "scarica-video-updater"})

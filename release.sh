@@ -95,6 +95,26 @@ if [ "$(uname -m)" != "arm64" ]; then
   exit 1
 fi
 
+# App aperta senza essere stata spostata col Finder: macOS la esegue da una
+# copia temporanea ("App Translocation") che può sparire sotto i piedi
+# (ffmpeg & co. introvabili). Auto-riparazione: trova l'app vera, le toglie
+# la quarantena (l'utente l'ha già approvata: sta girando) e la rilancia.
+case "$APP_ROOT" in
+  *"/AppTranslocation/"*)
+    REAL="$(mdfind "kMDItemCFBundleIdentifier == 'com.alekone.scaricavideo'" 2>/dev/null | grep -v AppTranslocation | grep -m1 "/Applications/")"
+    [ -d "$REAL" ] || REAL="$(mdfind "kMDItemCFBundleIdentifier == 'com.alekone.scaricavideo'" 2>/dev/null | grep -v AppTranslocation | head -1)"
+    if [ -d "$REAL" ]; then
+      xattr -dr com.apple.quarantine "$REAL" 2>/dev/null
+      open "$REAL"
+      exit 0
+    fi
+    osascript -e 'display alert "Scarica Video" message "macOS ha aperto l'"'"'app da una copia temporanea. Trascina Scarica Video nella cartella Applicazioni col Finder e riaprila da lì."' >/dev/null 2>&1
+    exit 1
+    ;;
+esac
+# Dopo il primo avvio approvato, via la quarantena: mai più translocation
+xattr -dr com.apple.quarantine "$APP_ROOT" 2>/dev/null || true
+
 if [ "$(cat "$MARKER" 2>/dev/null)" != "$STAMP" ] || ! "$VENV/bin/python3" -V >/dev/null 2>&1; then
   mkdir -p "$SUPPORT"
   osascript -e 'display notification "Preparo i componenti: solo il primo avvio, circa un minuto…" with title "Scarica Video"' >/dev/null 2>&1 || true

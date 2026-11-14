@@ -22,29 +22,30 @@ Sotto il cofano usa [`yt-dlp`](https://github.com/yt-dlp/yt-dlp); il backend è 
 
 I file finiscono in `~/Movies/Scarica Video`.
 
-## Requisiti
+## Installazione (per tutti)
 
-```bash
-brew install yt-dlp ffmpeg
-brew install gallery-dl   # opzionale, per foto/caroselli Instagram
-brew install whisper-cpp  # opzionale, per la trascrizione
-```
+Serve un **Mac con chip Apple** (M1 o successivi) e **macOS 13+**. Non serve installare nient'altro: dentro l'app c'è già tutto (Python, yt-dlp, ffmpeg, whisper).
 
-Per la trascrizione, al primo uso l'app scarica da sola i modelli (~1.7 GB, una volta sola) in `~/Library/Application Support/Scarica Video/models/` e installa `sherpa-onnx` nel proprio venv.
+1. Scarica lo zip dall'[**ultima release**](https://github.com/alekone/scarica-video/releases/latest) e decomprimilo
+2. Trascina **Scarica Video** nella cartella **Applicazioni**
+3. Aprila. Al primo avvio macOS la blocca (è un'app non firmata da uno sviluppatore registrato): vai in **Impostazioni di Sistema → Privacy e Sicurezza**, scorri in fondo e premi **Apri comunque**
+4. Il primo avvio prepara i componenti (~30 secondi), poi si apre la finestra
 
-macOS con Python 3 di sistema (`/usr/bin/python3`, già presente).
+**L'app si aggiorna da sola**: quando esce una versione nuova compare il bottone *Aggiorna* in alto — un click, si riavvia aggiornata. Anche yt-dlp si tiene aggiornato da solo ogni giorno (è il pezzo che si rompe quando i siti cambiano qualcosa).
 
-## Installazione
+Per la trascrizione, al primo uso l'app scarica da sola i modelli (~1.7 GB, una volta sola) in `~/Library/Application Support/Scarica Video/models/`.
+
+## Per sviluppatori
 
 ```bash
 git clone https://github.com/alekone/scarica-video.git
 cd scarica-video
-./build.sh
+./build.sh        # build di sviluppo: usa il Python e i tool di Homebrew
+./release.sh      # pacchetto distribuibile autosufficiente in dist/ (app + zip)
+./release.sh publish   # come sopra + release su GitHub (serve `gh` autenticato)
 ```
 
-`build.sh` crea un venv in `~/Library/Application Support/Scarica Video/venv`, ci installa `pywebview` e assembla **`Scarica Video.app`** in `~/Applications`. Aprila da Spotlight o Launchpad.
-
-> Al primo avvio macOS può chiedere conferma (app non firmata da uno sviluppatore identificato): **click destro sull'app → Apri → Apri**.
+La build di sviluppo richiede `brew install yt-dlp ffmpeg` (+ `gallery-dl` e `whisper-cpp` opzionali). Il pacchetto distribuibile invece include: runtime Python standalone ([python-build-standalone](https://github.com/astral-sh/python-build-standalone)), wheel offline di pywebview/yt-dlp/gallery-dl per il primo avvio, ffmpeg/ffprobe statici ([martin-riedl.de](https://ffmpeg.martin-riedl.de)) e whisper-cli statico con Metal incorporato.
 
 ### Uso senza app (headless)
 
@@ -56,8 +57,9 @@ python3 app.py    # poi apri http://127.0.0.1:8642
 
 ## Come funziona
 
-- `app.py` — server HTTP locale (stdlib) + interfaccia web + finestra nativa (pywebview, se disponibile). Gestisce coda, progressi, cronologia SQLite in `~/Library/Application Support/Scarica Video/`.
-- `build.sh` — prepara il venv, genera l'icona e assembla il bundle `.app` (launcher nativo + `Info.plist`).
+- `app.py` — server HTTP locale (stdlib) + interfaccia web + finestra nativa (pywebview, se disponibile). Gestisce coda, progressi, cronologia SQLite in `~/Library/Application Support/Scarica Video/`, e il controllo aggiornamenti sulle GitHub Releases.
+- `build.sh` — build di sviluppo: venv da Homebrew + bundle `.app` in `~/Applications`.
+- `release.sh` — pacchetto distribuibile: assembla runtime, wheel e binari statici nel bundle; il launcher al primo avvio prepara tutto in Application Support, offline.
 - `makeicon.py` — disegna l'icona (nessuna dipendenza grafica).
 
 ## Licenza

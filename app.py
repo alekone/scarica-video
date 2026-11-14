@@ -26,6 +26,9 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+VERSION = "2.0.0"
+REPO = "alekone/scarica-video"   # per il controllo aggiornamenti (GitHub Releases)
+
 PORT = 8642
 DEST = os.path.expanduser("~/Movies/Scarica Video")
 SUPPORT = os.path.expanduser("~/Library/Application Support/Scarica Video")
@@ -109,6 +112,102 @@ def apply_config():
     if config["concurrent"] != _applied_concurrent:
         slots = threading.Semaphore(int(config["concurrent"]))
         _applied_concurrent = config["concurrent"]
+
+
+# ---------------------------------------------------------------- aggiornamenti
+# L'app pacchettizzata (launcher con SV_APP nell'ambiente) controlla le release
+# su GitHub all'avvio: se ce n'è una più nuova, la UI mostra il bottone
+# "Aggiorna", che scarica lo zip e lancia lo script che sostituisce l'app.
+update_info = {"available": False, "latest": None, "url": None,
+               "size": 0, "state": None}
+
+UPDATER_SH = r'''#!/bin/bash
+# Aspetta che l'app esca, poi la sostituisce con la nuova versione e la rilancia.
+PID="$1"; ZIP="$2"; APP="$3"
+for i in $(seq 1 120); do kill -0 "$PID" 2>/dev/null || break; sleep 0.5; done
+TMP="$(mktemp -d)" || exit 1
+ditto -x -k "$ZIP" "$TMP" || exit 1
+NEW="$(/usr/bin/find "$TMP" -maxdepth 2 -name "*.app" -print -quit)"
+[ -d "$NEW" ] || exit 1
+BAK="$TMP/precedente.app"
+mv "$APP" "$BAK" 2>/dev/null
+if mv "$NEW" "$APP"; then
+  xattr -dr com.apple.quarantine "$APP" 2>/dev/null
+  rm -f "$ZIP"
+else
+  mv "$BAK" "$APP" 2>/dev/null       # qualcosa è andato storto: ripristina
+fi
+open "$APP"
+rm -rf "$TMP"
+'''
+
+
+def parse_ver(s):
+    try:
+        return tuple(int(x) for x in str(s).strip().lstrip("v").split(".")[:3])
+    except ValueError:
+        return ()
+
+
+def check_update():
+    if not os.path.isdir(os.environ.get("SV_APP", "")):
+        return                       # modalità sviluppo: niente auto-update
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{REPO}/releases/latest",
+            headers={"User-Agent": "scarica-video-updater",
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            rel = json.load(r)
+        latest = rel.get("tag_name") or ""
+        if parse_ver(latest) <= parse_ver(VERSION):
+            return
+        asset = next((a for a in rel.get("assets") or []
+                      if str(a.get("name", "")).endswith(".zip")), None)
+        if not asset:
+            return
+        with lock:
+            update_info.update(available=True, latest=latest.lstrip("v"),
+                               url=asset["browser_download_url"],
+                               size=asset.get("size") or 0)
+    except Exception:
+        pass                          # offline o API giù: riproverà al prossimo avvio
+
+
+def do_update():
+    """Scarica la nuova versione e avvia lo scambio. Ritorna un errore o None
+    (e in quel caso l'app esce da sola mezzo secondo dopo la risposta)."""
+    app_path = os.environ.get("SV_APP", "")
+    with lock:
+        url = update_info.get("url")
+        update_info["state"] = "scarico"
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url or "").hostname or ""
+        if not (host == "github.com" or host.endswith(".github.com")
+                or host.endswith(".githubusercontent.com")):
+            raise ValueError("origine aggiornamento non riconosciuta")
+        if not os.path.isdir(app_path):
+            raise ValueError("app non trovata")
+        zip_path = os.path.join(SUPPORT, "update.zip")
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "scarica-video-updater"})
+        with urllib.request.urlopen(req, timeout=120) as r, \
+                open(zip_path, "wb") as f:
+            shutil.copyfileobj(r, f)
+        sh = os.path.join(SUPPORT, "updater.sh")
+        with open(sh, "w") as f:
+            f.write(UPDATER_SH)
+        os.chmod(sh, 0o755)
+        subprocess.Popen(["/bin/bash", sh, str(os.getpid()), zip_path, app_path],
+                         start_new_session=True, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except Exception as e:
+        with lock:
+            update_info["state"] = None
+        return f"aggiornamento fallito: {e}"
+    threading.Timer(0.5, lambda: os._exit(0)).start()
+    return None
 
 
 # ---------------------------------------------------------------- preview
@@ -954,7 +1053,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
-            self._send(HTML.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
+            page = HTML.replace("__TOKEN__", TOKEN).replace("__VERSION__", VERSION)
+            self._send(page, "text/html; charset=utf-8")
         elif self.path == "/ping":
             self._send("ok", "text/plain")
         elif not self._authed():
@@ -965,7 +1065,8 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 data = {"done": done_count,
                         "jobs": [dict(jobs[j]) for j in jobs_order],
-                        "tjobs": [dict(tjobs[j]) for j in tjobs_order]}
+                        "tjobs": [dict(tjobs[j]) for j in tjobs_order],
+                        "update": dict(update_info)}
             self._send(data)
         elif self.path == "/api/history":
             self._send(load_history())
@@ -1066,6 +1167,12 @@ class Handler(BaseHTTPRequestHandler):
             save_config()
             apply_config()
             self._send({"ok": True, **config})
+        elif self.path == "/api/do_update":
+            err = do_update()
+            if err:
+                self._send({"ok": False, "error": err}, code=500)
+            else:
+                self._send({"ok": True})
         elif self.path == "/api/quit":
             self._send({"ok": True})
             threading.Timer(0.3, lambda: os._exit(0)).start()
@@ -1170,6 +1277,7 @@ HTML = r"""<!doctype html>
   <div class="logo"><svg viewBox="0 0 24 24"><path d="M12 3v10.2l3.6-3.6L17 11l-5 5-5-5 1.4-1.4L12 13.2V3h0zM5 19h14v2H5z"/></svg></div>
   <div><h1>Scarica Video</h1><div class="sub">YouTube · TikTok · Instagram e centinaia di siti</div></div>
   <div class="spacer"></div>
+  <button class="ghost" id="updBtn" style="display:none; color:var(--accent); border-color:var(--accent); font-weight:600" onclick="doUpdate()"></button>
   <button class="ghost" onclick="transcribeLocal()">Trascrivi file…</button>
   <button class="ghost" onclick="openFolder()">Apri cartella</button>
   <button class="ghost" onclick="openSettings()">Impostazioni</button>
@@ -1258,6 +1366,7 @@ HTML = r"""<!doctype html>
         </select></div>
     </div>
     <div class="sheetacts">
+      <span class="dot" style="align-self:center; margin-right:auto">Scarica Video __VERSION__</span>
       <button class="ghost" onclick="closeSettings()">Annulla</button>
       <button class="go" onclick="saveSettings()">Salva</button>
     </div>
@@ -1420,6 +1529,22 @@ function applyDefaults(s){
   $('#quality').value = s.quality; $('#browser').value = s.browser;
 }
 
+// --------------------------------------------------------- aggiornamento app
+async function doUpdate(){
+  if(!confirm('Scarico la nuova versione e riavvio l\'app (i download in corso si fermano). Procedo?')) return;
+  const b = $('#updBtn');
+  b.textContent = 'Aggiorno…'; b.disabled = true;
+  try{
+    const r = await api('/api/do_update', {});
+    if(r.ok){
+      document.body.innerHTML = '<div class="wrap"><p class="empty">Aggiornamento in corso… l\'app si riavvia da sola tra qualche secondo.</p></div>';
+      return;
+    }
+    alert(r.error || 'Aggiornamento fallito');
+  }catch(e){ alert('Aggiornamento fallito: ' + e); }
+  b.textContent = 'Riprova aggiornamento'; b.disabled = false;
+}
+
 // ----------------------------------------------------------------- polling
 let lastDone = null;
 
@@ -1475,6 +1600,15 @@ async function refresh(){
       <div class="meta">${line}</div>
       <div class="track"><div class="fill" style="width:${pct}%"></div></div>${acts}</div>`;
   }).join('');
+
+  // Aggiornamento disponibile: bottone in alto
+  const u = r.update;
+  if(u && u.available){
+    const b = $('#updBtn');
+    b.style.display = 'inline-block';
+    b.textContent = u.state==='scarico' ? 'Aggiorno…' : `Aggiorna alla ${u.latest}`;
+    b.disabled = !!u.state;
+  }
 
   // Cronologia e cartella cambiano solo quando un job finisce
   if(r.done !== lastDone){
@@ -1544,6 +1678,7 @@ if __name__ == "__main__":
     load_config()
     os.makedirs(DEST, exist_ok=True)
     update_ytdlp_daily()
+    threading.Thread(target=check_update, daemon=True).start()
     url = f"http://127.0.0.1:{PORT}/"
     # Avvia il server; se la porta è occupata un'istanza è già attiva -> apri solo la finestra
     try:

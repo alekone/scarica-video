@@ -3,6 +3,11 @@ icon_1024.png
 AppIcon.icns
 build.iconset/
 
+# Packaging distribuibile (release.sh)
+vendor/*
+!vendor/README.md
+dist/
+
 # macOS / Python
 .DS_Store
 __pycache__/
